@@ -840,8 +840,8 @@ fn reviewerUnavailableOutcome(call: ToolCall) command_admission.PermissionOutcom
     };
 }
 
-/// Maps every non-allow automatic review to one recoverable denial. Human
-/// approval is reserved for the orchestrator-derived recovery threshold.
+/// Maps every non-allow automatic review to one recoverable denial. A
+/// separately selected human-approval phase bypasses automatic review below.
 fn nonAllowAutoReviewOutcome(
     review: permission_auto_classifier.ParseOutcome,
 ) ?command_admission.PermissionOutcome {
