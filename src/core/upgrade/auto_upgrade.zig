@@ -1,4 +1,5 @@
 const std = @import("std");
+const omfx = @import("../../omfx.zig");
 const io_mod = @import("../shared/io.zig");
 const helpers = @import("upgrade_helpers.zig");
 const update_target = @import("update_target.zig");
@@ -28,6 +29,7 @@ pub const RelaunchRequest = struct {
 };
 
 pub fn shouldEnableForCurrentExecutable() bool {
+    if (!omfx.upstream_upgrades_enabled) return false;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = std.process.executablePath(io_mod.getIo(), &exe_buf) catch return true;
     return !isDevelopmentBuildPath(exe_buf[0..n]);

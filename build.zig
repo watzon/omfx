@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(WasmSurface, "wasm_surface", .none);
 
     const exe = b.addExecutable(.{
-        .name = "fx",
+        .name = "omfx",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -67,6 +67,11 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("build_options", build_options.createModule());
 
     b.installArtifact(exe);
+
+    // omfx: also install the binary under the upstream name so upstream
+    // tests, benchmarks, and docs that reference zig-out/bin/fx stay valid.
+    const fx_alias = b.addInstallArtifact(exe, .{ .dest_sub_path = "fx" });
+    b.getInstallStep().dependOn(&fx_alias.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

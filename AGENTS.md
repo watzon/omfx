@@ -2,6 +2,17 @@
 
 Instructions for AI coding agents working with this codebase.
 
+## omfx fork notice
+
+<!-- omfx: fork-owned section. On upstream merge conflicts, keep this section and take the upstream side of the rest of the file. -->
+
+This repository is **omfx** (`watzon/omfx`), a batteries-included fork of `vercel-labs/fx`. The rest of this file is upstream-owned; where it says the canonical repository is `vercel-labs/fx`, that applies to upstream references only. Fork rules:
+
+* Read `UPSTREAM.md` before changing shared files. New capabilities go in new files; shared upstream files get minimal hooks marked `// omfx:`.
+* The product binary is `zig-out/bin/omfx`. The build also installs a copy at `zig-out/bin/fx`, so upstream instructions that reference that path stay valid.
+* Do not rebrand upstream identifiers, `~/.fx/` paths, `FX_*` variables, or in-app strings. See the divergence rules in `UPSTREAM.md`.
+* Upstream upgrade downloads are disabled through `src/omfx.zig`. Do not re-enable them.
+
 ## Declaring Work Ready
 
 Do not say the work is "ready", "done", "good to go", "complete", or similar until you have personally run the binary and exercised the change on its happy path. A passing test suite is necessary, not sufficient — tests in this repo do not always construct the full runtime, attach a TTY, or spawn background threads, so they will not catch startup crashes, render regressions, or thread-lifetime bugs.
