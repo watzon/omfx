@@ -35,11 +35,11 @@ These files exist only in omfx. Upstream merges never touch them:
 
 * `src/omfx.zig`: fork identity constants and the `upstream_upgrades_enabled` flag.
 * `UPSTREAM.md`: this document.
-* `src/core/providers/`: direct provider registry, credentials, router, and OAuth flows.
+* `src/core/providers/`: direct provider registry, credentials, router, OAuth flows, interactive sign-in driver, model catalog, and catalog merge.
 * `src/gateway/openai_json.zig`, `src/gateway/openai_stream_provider.zig`: OpenAI-compatible wire codecs and transport.
 * `tests/e2e/direct-providers.test.ts`: deterministic coverage for direct provider routing.
 
-Shared files with `// omfx:` hooks at the time of writing: `build.zig` (binary name and `fx` alias install), `src/main.zig` (version suffix), `src/core/upgrade/auto_upgrade.zig` (upgrade gate), `src/core/cli/cli_surface.zig` (upgrade gate, provider login/logout), `src/builtins/gateway.zig` (provider router), `src/builtins/commands.zig` (login/logout usage text), `src/core/cli/cli_ask.zig` and `src/core/app/app_auth_runtime.zig` (direct credentials satisfy the credential gate), and a fork notice at the top of `AGENTS.md`. The grep command above is authoritative; this list is a snapshot.
+Shared files with `// omfx:` hooks at the time of writing: `build.zig` (binary name and `fx` alias install), `src/main.zig` (version suffix, direct-credential prompt admission), `src/core/upgrade/auto_upgrade.zig` (upgrade gate), `src/core/cli/cli_surface.zig` (upgrade gate, provider login/logout, status), `src/builtins/gateway.zig` (provider router, catalog merge), `src/builtins/commands.zig` (login/logout usage text), `src/core/cli/cli_ask.zig` and `src/core/app/app_auth_runtime.zig` (direct credentials satisfy the credential gate; picker dispatch and sign-in pump), `src/core/auth/auth_runtime.zig` and `src/ui/footer/picker_presentation.zig` (provider options in the onboarding and setup pickers), `src/core/output/output_contracts.zig` and `src/core/session/session_commands.zig` (direct providers in status output), and a fork notice at the top of `AGENTS.md`. The grep command above is authoritative; this list is a snapshot.
 
 ## Sync procedure
 

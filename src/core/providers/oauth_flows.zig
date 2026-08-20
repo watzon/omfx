@@ -62,6 +62,8 @@ pub const FlowError = error{
     UntrustedOAuthEndpoint,
     /// Direct provider sign-in is native-only.
     DirectProviderAuthUnsupported,
+    /// The waiting phase already ran for this pending login.
+    PendingAlreadyConsumed,
 };
 
 pub const LoginOutcome = struct {
@@ -71,12 +73,128 @@ pub const LoginOutcome = struct {
 
 /// Signs in to `def` interactively, printing progress to stderr, and stores
 /// the resulting session. Dispatches on `def.oauth.style`.
+///
+/// This is the terminal-owning composition of the two phases below. A caller
+/// that renders its own UI should call `begin*` on the main thread, draw the
+/// URL, and run `await*` on a worker thread.
 pub fn runLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     def: *const registry.Def,
 ) !void {
     _ = try runLoginWith(alloc, transport, def, .{});
+}
+
+// --- Two-phase login -----------------------------------------------------
+//
+// Each flow splits into a fast phase that produces something to show the user
+// and a blocking phase that waits for the user to act on it. The blocking
+// phase never touches a terminal, a browser, or process-wide mutable state:
+// everything it needs is in the pending value, the transport, and the
+// allocator, so it is safe on a `std.Thread` with `std.heap.c_allocator`.
+
+/// What the user must be shown to finish an RFC 8628 device sign-in, plus the
+/// state `awaitDeviceLogin` needs. Owns every slice it holds.
+pub const DevicePending = struct {
+    /// `verification_uri_complete` when the issuer supplied one, else `verification_uri`.
+    verification_url: []u8,
+    user_code: []u8,
+    /// Discovered endpoints, already checked against the issuer's domain.
+    metadata: oauth.Metadata,
+    device_code: []u8,
+    /// Current polling interval. `awaitDeviceLogin` grows it on `slow_down`.
+    interval_ms: u64,
+    /// Absolute instant the device code stops being accepted.
+    expires_at_ms: i64,
+
+    pub fn deinit(self: *DevicePending, alloc: Allocator) void {
+        alloc.free(self.verification_url);
+        self.verification_url = &.{};
+        alloc.free(self.user_code);
+        self.user_code = &.{};
+        secret.zeroAndFree(alloc, self.device_code);
+        self.device_code = &.{};
+        self.metadata.deinit(alloc);
+        self.metadata = .{
+            .issuer = &.{},
+            .device_authorization_endpoint = &.{},
+            .token_endpoint = &.{},
+        };
+    }
+};
+
+/// The authorize URL to open, plus the bound listener and PKCE material
+/// `awaitPkceLogin` needs. Owns every slice it holds.
+pub const PkcePending = struct {
+    authorize_url: []u8,
+    /// Redirect URI registered in `authorize_url`, replayed on token exchange.
+    redirect_uri: []u8,
+    /// Set when the browser reported a failure, so the caller can name it
+    /// after `awaitPkceLogin` returns `error.AuthorizationDenied`.
+    failure_detail: ?[]u8 = null,
+    state: [state_hex_len]u8,
+    verifier: [verifier_len]u8,
+    /// Null once the waiting phase has taken and closed the listener.
+    listener: ?Loopback,
+
+    pub fn deinit(self: *PkcePending, alloc: Allocator) void {
+        if (self.listener) |*listener| {
+            listener.deinit();
+            self.listener = null;
+        }
+        alloc.free(self.authorize_url);
+        self.authorize_url = &.{};
+        alloc.free(self.redirect_uri);
+        self.redirect_uri = &.{};
+        if (self.failure_detail) |value| alloc.free(value);
+        self.failure_detail = null;
+        std.crypto.secureZero(u8, &self.verifier);
+    }
+
+    /// The loopback port the listener actually bound.
+    pub fn callbackPort(self: *PkcePending) u16 {
+        var listener = self.listener orelse return 0;
+        return listener.port();
+    }
+};
+
+/// Fast phase of the device flow: OIDC discovery plus the device
+/// authorization request, two round trips and no waiting.
+pub fn beginDeviceLogin(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    def: *const registry.Def,
+) !DevicePending {
+    return beginDeviceLoginWith(alloc, transport, def, .{});
+}
+
+/// Blocking phase of the device flow: polls the token endpoint until the user
+/// approves, then stores the session. Safe to call off the main thread.
+pub fn awaitDeviceLogin(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    def: *const registry.Def,
+    pending: *DevicePending,
+) !void {
+    return awaitDeviceLoginWith(alloc, transport, def, pending, .{});
+}
+
+/// Fast phase of the PKCE flow: generates the PKCE material, binds the
+/// loopback listener, and composes the authorize URL. Performs no network I/O.
+pub fn beginPkceLogin(alloc: Allocator, def: *const registry.Def) !PkcePending {
+    return beginPkceLoginOnPort(alloc, def, def.oauth.callback_port);
+}
+
+/// Blocking phase of the PKCE flow: accepts the browser callback, exchanges
+/// the code, reads the account id, and stores the session. Safe to call off
+/// the main thread. Consumes the listener, so a later `deinit` is a no-op.
+pub fn awaitPkceLogin(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    def: *const registry.Def,
+    pending: *PkcePending,
+) !void {
+    _ = try awaitPkceLoginWith(alloc, transport, def, pending, .{});
 }
 
 /// Refreshes the session when it is inside the 60 second expiry skew, then
@@ -118,6 +236,9 @@ const Deps = struct {
     notify_fn: *const fn (?*anyopaque, []const u8) void = defaultNotify,
     open_url_fn: *const fn (?*anyopaque, Allocator, []const u8) bool = defaultOpenUrl,
     store: Store = .{},
+    /// Overrides the registered loopback port. Only tests set this; production
+    /// must bind the exact port the redirect URI is registered for.
+    callback_port: ?u16 = null,
 
     fn now(self: Deps) i64 {
         return self.now_ms(self.ctx);
@@ -168,6 +289,8 @@ fn defaultOpenUrl(_: ?*anyopaque, alloc: Allocator, url: []const u8) bool {
 
 // --- Login dispatch ------------------------------------------------------
 
+/// Terminal-owning composition of the two phases. Every message the user sees
+/// during sign-in is printed from here, never from `begin*` or `await*`.
 fn runLoginWith(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -175,23 +298,87 @@ fn runLoginWith(
     deps: Deps,
 ) !LoginOutcome {
     const outcome = switch (def.oauth.style) {
-        .oidc_device => try runDeviceLogin(alloc, transport, def, deps),
-        .pkce_loopback => try runPkceLogin(alloc, transport, def, deps),
+        .oidc_device => try runDeviceLoginPhases(alloc, transport, def, deps),
+        .pkce_loopback => try runPkceLoginPhases(alloc, transport, def, deps),
     };
     deps.sayFmt("Signed in to {s}.\n", .{outcome.provider_label});
     return outcome;
 }
 
-// --- oidc_device (xAI) ---------------------------------------------------
-
-fn runDeviceLogin(
+fn runDeviceLoginPhases(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     def: *const registry.Def,
     deps: Deps,
 ) !LoginOutcome {
+    var pending = try beginDeviceLoginWith(alloc, transport, def, deps);
+    defer pending.deinit(alloc);
+
+    deps.sayFmt("Open {s}\nCode: {s}\n\n", .{ pending.verification_url, pending.user_code });
+    _ = deps.openUrl(alloc, pending.verification_url);
+    deps.say("Waiting for authorization...\n");
+
+    awaitDeviceLoginWith(alloc, transport, def, &pending, deps) catch |err| {
+        switch (err) {
+            oauth.OAuthError.AccessDenied => deps.say("Sign-in was denied in the browser.\n"),
+            FlowError.DeviceCodeExpired,
+            oauth.OAuthError.ExpiredToken,
+            => deps.say("The sign-in code expired before it was approved.\n"),
+            else => {},
+        }
+        return err;
+    };
+    return .{ .provider_label = def.label, .account_id_present = false };
+}
+
+fn runPkceLoginPhases(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    def: *const registry.Def,
+    deps: Deps,
+) !LoginOutcome {
+    var pending = beginPkceLoginOnPort(
+        alloc,
+        def,
+        deps.callback_port orelse def.oauth.callback_port,
+    ) catch |err| {
+        if (err == FlowError.CallbackPortBusy) {
+            deps.sayFmt(
+                "Port {d} is already in use. {s} only accepts the sign-in redirect on that " ++
+                    "exact port, so close the other listener and run the sign-in again.\n",
+                .{ def.oauth.callback_port, def.label },
+            );
+        }
+        return err;
+    };
+    defer pending.deinit(alloc);
+
+    deps.sayFmt("Open {s}\n\n", .{pending.authorize_url});
+    _ = deps.openUrl(alloc, pending.authorize_url);
+    deps.say("Waiting for the browser to finish sign-in. Press ctrl+c to cancel.\n");
+
+    const account_id_present = awaitPkceLoginWith(alloc, transport, def, &pending, deps) catch |err| {
+        if (err == FlowError.AuthorizationDenied) {
+            deps.sayFmt("Sign-in failed: {s}.\n", .{pending.failure_detail orelse "denied in the browser"});
+        }
+        return err;
+    };
+    if (!account_id_present) {
+        deps.say("Signed in, but the account id was missing from the token response.\n");
+    }
+    return .{ .provider_label = def.label, .account_id_present = account_id_present };
+}
+
+// --- oidc_device (xAI) ---------------------------------------------------
+
+fn beginDeviceLoginWith(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    def: *const registry.Def,
+    deps: Deps,
+) !DevicePending {
     var metadata = try oauth.discover(alloc, transport, def.oauth.issuer);
-    defer metadata.deinit(alloc);
+    errdefer metadata.deinit(alloc);
     try validateIssuerEndpoint(def.oauth.issuer, metadata.device_authorization_endpoint);
     try validateIssuerEndpoint(def.oauth.issuer, metadata.token_endpoint);
 
@@ -204,12 +391,34 @@ fn runDeviceLogin(
     );
     defer device.deinit(alloc);
 
-    const display_url = device.verification_uri_complete orelse device.verification_uri;
-    deps.sayFmt("Open {s}\nCode: {s}\n\n", .{ display_url, device.user_code });
-    _ = deps.openUrl(alloc, display_url);
-    deps.say("Waiting for authorization...\n");
+    const verification_url = try alloc.dupe(
+        u8,
+        device.verification_uri_complete orelse device.verification_uri,
+    );
+    errdefer alloc.free(verification_url);
+    const user_code = try alloc.dupe(u8, device.user_code);
+    errdefer alloc.free(user_code);
+    const device_code = try alloc.dupe(u8, device.device_code);
+    errdefer secret.zeroAndFree(alloc, device_code);
 
-    var token = try pollForDeviceToken(alloc, transport, metadata, def, device, deps);
+    return .{
+        .verification_url = verification_url,
+        .user_code = user_code,
+        .metadata = metadata,
+        .device_code = device_code,
+        .interval_ms = pollIntervalMs(device.interval),
+        .expires_at_ms = try oauth.expiry_timestamp_ms(deps.now(), @max(device.expires_in, 1)),
+    };
+}
+
+fn awaitDeviceLoginWith(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    def: *const registry.Def,
+    pending: *DevicePending,
+    deps: Deps,
+) !void {
+    var token = try pollForDeviceToken(alloc, transport, def, pending, deps);
     defer token.deinit(alloc);
 
     const expires_at_ms = try oauth.expiry_timestamp_ms(deps.now(), token.expires_in);
@@ -218,15 +427,13 @@ fn runDeviceLogin(
         .access_token = token.access_token,
         .refresh_token = token.refresh_token,
         .expires_at_ms = expires_at_ms,
-        .token_url = metadata.token_endpoint,
+        .token_url = pending.metadata.token_endpoint,
         .client_id = def.oauth.client_id,
         .scope = if (token.scope.len > 0) token.scope else def.oauth.scope,
         .account_id = null,
     });
     defer session.deinit(alloc);
     try deps.save(alloc, session);
-
-    return .{ .provider_label = def.label, .account_id_present = false };
 }
 
 /// The upstream helper hard-codes the Vercel scope, so the fork owns the form.
@@ -249,57 +456,42 @@ fn requestDeviceAuthorization(
     return oauth.parseDeviceAuthorization(alloc, bytes);
 }
 
+/// Waits out the user's approval. Reads and updates the polling interval on
+/// `pending` so a caller can inspect the backoff, and reports every failure as
+/// an error instead of a message.
 fn pollForDeviceToken(
     alloc: Allocator,
     transport: oauth_transport.Provider,
-    metadata: oauth.Metadata,
     def: *const registry.Def,
-    device: oauth.DeviceAuthorization,
+    pending: *DevicePending,
     deps: Deps,
 ) !oauth.TokenSet {
-    var interval_ms = pollIntervalMs(device.interval);
-    const started_ms = deps.now();
-    const window_ms: i64 = @max(device.expires_in, 1) *| std.time.ms_per_s;
     var cancel_flag = std.atomic.Value(bool).init(false);
-
     while (true) {
-        if (deps.now() -| started_ms > window_ms) {
-            deps.say("The sign-in code expired before it was approved.\n");
-            return FlowError.DeviceCodeExpired;
-        }
-        deps.sleep(interval_ms);
+        if (deps.now() >= pending.expires_at_ms) return FlowError.DeviceCodeExpired;
+        deps.sleep(pending.interval_ms);
 
         const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
             .clock = .awake,
             .raw = .fromMilliseconds(@intCast(request_timeout_ms)),
         });
-        const result = oauth.pollDeviceTokenBounded(
+        const result = try oauth.pollDeviceTokenBounded(
             alloc,
             transport,
-            metadata,
+            pending.metadata,
             def.oauth.client_id,
-            device.device_code,
+            pending.device_code,
             &cancel_flag,
             deadline,
-        ) catch |err| {
-            switch (err) {
-                oauth.OAuthError.AccessDenied => deps.say("Sign-in was denied in the browser.\n"),
-                oauth.OAuthError.ExpiredToken => deps.say("The sign-in code expired before it was approved.\n"),
-                else => {},
-            }
-            debug_trace.logf(
-                "auth",
-                "provider device poll failed provider={s} err={s}",
-                .{ def.key, @errorName(err) },
-            );
-            return err;
-        };
+        );
         switch (result) {
             .success => |token| return token,
             .pending => {},
             .slow_down => {
-                interval_ms +|= slow_down_step_ms;
-                if (interval_ms > max_poll_interval_ms) return oauth.OAuthError.InvalidOAuthResponse;
+                pending.interval_ms +|= slow_down_step_ms;
+                if (pending.interval_ms > max_poll_interval_ms) {
+                    return oauth.OAuthError.InvalidOAuthResponse;
+                }
             },
         }
     }
@@ -312,51 +504,62 @@ fn pollIntervalMs(interval_seconds: i64) u64 {
 
 // --- pkce_loopback (OpenAI) ---------------------------------------------
 
-fn runPkceLogin(
+/// `requested_port` is the registered redirect port in production. Tests pass
+/// 0 and read the assigned port back off the pending value; the redirect URI
+/// always names the port that was actually bound.
+fn beginPkceLoginOnPort(
+    alloc: Allocator,
+    def: *const registry.Def,
+    requested_port: u16,
+) !PkcePending {
+    var pkce = generatePkce();
+    errdefer pkce.zero();
+
+    var listener = try Loopback.bind(requested_port);
+    errdefer listener.deinit();
+
+    const redirect_uri = try std.fmt.allocPrint(alloc, "http://localhost:{d}{s}", .{
+        listener.port(),
+        def.oauth.callback_path,
+    });
+    errdefer alloc.free(redirect_uri);
+
+    const state = randomStateHex();
+    const authorize_url = try buildAuthorizeUrl(alloc, def, redirect_uri, &pkce.challenge, &state);
+    errdefer alloc.free(authorize_url);
+
+    return .{
+        .authorize_url = authorize_url,
+        .redirect_uri = redirect_uri,
+        .state = state,
+        .verifier = pkce.verifier,
+        .listener = listener,
+    };
+}
+
+/// Returns whether an account id was found. The caller reports that; this
+/// phase only records a browser-supplied failure string on `pending`.
+fn awaitPkceLoginWith(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     def: *const registry.Def,
+    pending: *PkcePending,
     deps: Deps,
-) !LoginOutcome {
-    var pkce = generatePkce();
-    defer pkce.zero();
-    const state = randomStateHex();
-
-    var listener = Loopback.bind(def.oauth.callback_port) catch |err| switch (err) {
-        FlowError.CallbackPortBusy => {
-            deps.sayFmt(
-                "Port {d} is already in use. {s} only accepts the sign-in redirect on that " ++
-                    "exact port, so close the other listener and run the sign-in again.\n",
-                .{ def.oauth.callback_port, def.label },
-            );
-            return err;
-        },
-        else => return err,
-    };
+) !bool {
+    var listener = pending.listener orelse return FlowError.PendingAlreadyConsumed;
+    pending.listener = null;
     defer listener.deinit();
-
-    const redirect_uri = try std.fmt.allocPrint(alloc, "http://localhost:{d}{s}", .{
-        def.oauth.callback_port,
-        def.oauth.callback_path,
-    });
-    defer alloc.free(redirect_uri);
-
-    const authorize_url = try buildAuthorizeUrl(alloc, def, redirect_uri, &pkce.challenge, &state);
-    defer alloc.free(authorize_url);
-
-    deps.sayFmt("Open {s}\n\n", .{authorize_url});
-    _ = deps.openUrl(alloc, authorize_url);
-    deps.say("Waiting for the browser to finish sign-in. Press ctrl+c to cancel.\n");
 
     var callback = try listener.awaitCallback(alloc, callback_deadline_ms);
     defer callback.deinit(alloc);
 
     if (callback.err_code) |code| {
-        deps.sayFmt("Sign-in failed: {s}.\n", .{callback.err_description orelse code});
+        const detail = callback.err_description orelse code;
+        pending.failure_detail = alloc.dupe(u8, detail) catch null;
         return FlowError.AuthorizationDenied;
     }
     const returned_state = callback.state orelse return FlowError.CallbackStateMismatch;
-    if (!std.mem.eql(u8, returned_state, &state)) return FlowError.CallbackStateMismatch;
+    if (!std.mem.eql(u8, returned_state, &pending.state)) return FlowError.CallbackStateMismatch;
     const code = callback.code orelse return FlowError.InvalidCallbackRequest;
 
     var tokens = try exchangeAuthorizationCode(
@@ -364,8 +567,8 @@ fn runPkceLogin(
         transport,
         def,
         code,
-        redirect_uri,
-        &pkce.verifier,
+        pending.redirect_uri,
+        &pending.verifier,
     );
     defer tokens.deinit(alloc);
 
@@ -386,10 +589,7 @@ fn runPkceLogin(
     defer session.deinit(alloc);
     try deps.save(alloc, session);
 
-    if (account_id == null) {
-        deps.say("Signed in, but the account id was missing from the token response.\n");
-    }
-    return .{ .provider_label = def.label, .account_id_present = account_id != null };
+    return account_id != null;
 }
 
 fn exchangeAuthorizationCode(
@@ -447,6 +647,7 @@ fn buildAuthorizeUrl(
 const b64 = std.base64.url_safe_no_pad;
 const verifier_len = 86; // base64url, no padding, of 64 random bytes
 const challenge_len = 43; // base64url, no padding, of a SHA-256 digest
+const state_hex_len = 32; // lowercase hex of 16 random bytes
 
 const Pkce = struct {
     verifier: [verifier_len]u8,
@@ -476,7 +677,7 @@ fn pkceChallenge(verifier: []const u8) [challenge_len]u8 {
     return out;
 }
 
-fn randomStateHex() [32]u8 {
+fn randomStateHex() [state_hex_len]u8 {
     var raw: [16]u8 = undefined;
     io_mod.getIo().random(&raw);
     return std.fmt.bytesToHex(raw, .lower);
@@ -983,13 +1184,44 @@ const Step = struct {
     body: []const u8 = "{}",
 };
 
+// Shared xAI device-flow script, reused by the composed and per-phase tests.
+const xai_discovery_step = Step{
+    .method = .get,
+    .url = "https://auth.x.ai/.well-known/openid-configuration",
+    .body = "{\"issuer\":\"https://auth.x.ai\"," ++
+        "\"device_authorization_endpoint\":\"https://auth.x.ai/oauth2/device/code\"," ++
+        "\"token_endpoint\":\"https://auth.x.ai/oauth2/token\"}",
+};
+
+const xai_device_step = Step{
+    .method = .post_form,
+    .url = "https://auth.x.ai/oauth2/device/code",
+    .payload = "client_id=b1a00492-073a-47ea-816f-4c329264a828&scope=openid%20profile%20" ++
+        "email%20offline_access%20grok-cli%3Aaccess%20api%3Aaccess",
+    .body = "{\"device_code\":\"device-code\",\"user_code\":\"ABCD-EFGH\"," ++
+        "\"verification_uri\":\"https://x.ai/device\"," ++
+        "\"verification_uri_complete\":\"https://x.ai/device?code=ABCD-EFGH\"," ++
+        "\"expires_in\":600,\"interval\":1}",
+};
+
+const xai_token_body = "{\"access_token\":\"xai-access\",\"refresh_token\":\"xai-refresh\"," ++
+    "\"expires_in\":3600,\"scope\":\"openid api:access\",\"token_type\":\"Bearer\"}";
+
 const ScriptedTransport = struct {
     steps: []const Step,
     index: usize = 0,
     mismatch: ?usize = null,
+    /// Last request body, for assertions that cannot be written literally
+    /// because they contain an ephemeral port or generated PKCE material.
+    last_payload: [2048]u8 = @splat(0),
+    last_payload_len: usize = 0,
 
     fn provider(self: *ScriptedTransport) oauth_transport.Provider {
         return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn lastPayload(self: *ScriptedTransport) []const u8 {
+        return self.last_payload[0..self.last_payload_len];
     }
 
     fn execute(
@@ -1006,10 +1238,12 @@ const ScriptedTransport = struct {
         if (step.url) |url| {
             if (!std.mem.eql(u8, url, request.url)) self.mismatch = self.index;
         }
+        const actual = request.payload orelse "";
         if (step.payload) |payload| {
-            const actual = request.payload orelse "";
             if (!std.mem.eql(u8, payload, actual)) self.mismatch = self.index;
         }
+        self.last_payload_len = @min(actual.len, self.last_payload.len);
+        @memcpy(self.last_payload[0..self.last_payload_len], actual[0..self.last_payload_len]);
         self.index += 1;
         return .{
             .disposition = step.disposition,
@@ -1036,6 +1270,38 @@ const RejectingTransport = struct {
     }
 };
 
+/// Reads the ephemeral port and the state back out of the authorize URL that
+/// `runLogin` prints. This is how the fake browser learns where to connect
+/// without the test guessing a port and racing the bind.
+const AuthorizeProbe = struct {
+    port: std.atomic.Value(u16) = .init(0),
+    state_buf: [state_hex_len]u8 = @splat(0),
+    state_len: usize = 0,
+
+    fn observe(self: *AuthorizeProbe, url: []const u8) void {
+        const port_marker = "localhost%3A";
+        const port_at = std.mem.find(u8, url, port_marker) orelse return;
+        const after_port = url[port_at + port_marker.len ..];
+        var digits: usize = 0;
+        while (digits < after_port.len and std.ascii.isDigit(after_port[digits])) digits += 1;
+        const port = std.fmt.parseInt(u16, after_port[0..digits], 10) catch return;
+
+        const state_marker = "&state=";
+        const state_at = std.mem.find(u8, url, state_marker) orelse return;
+        const after_state = url[state_at + state_marker.len ..];
+        const end = std.mem.findScalar(u8, after_state, '&') orelse after_state.len;
+        if (end > self.state_buf.len) return;
+        @memcpy(self.state_buf[0..end], after_state[0..end]);
+        self.state_len = end;
+        // Published last: a nonzero port means the state is already readable.
+        self.port.store(port, .release);
+    }
+
+    fn state(self: *AuthorizeProbe) []const u8 {
+        return self.state_buf[0..self.state_len];
+    }
+};
+
 /// One context for every injected dependency: a fake clock that records the
 /// sleeps, a silent terminal, no browser, and a session store pointed at a
 /// temp directory through `auth_store`'s directory seam.
@@ -1046,6 +1312,7 @@ const TestEnv = struct {
     saves: usize = 0,
     dir: ?*io_mod.VerifiedDir = null,
     messages: std.ArrayList(u8) = .empty,
+    authorize: AuthorizeProbe = .{},
 
     fn deinit(self: *TestEnv) void {
         self.messages.deinit(testing.allocator);
@@ -1080,7 +1347,9 @@ const TestEnv = struct {
     }
 
     fn notify(raw: ?*anyopaque, text: []const u8) void {
-        state(raw).messages.appendSlice(testing.allocator, text) catch {};
+        const self = state(raw);
+        self.messages.appendSlice(testing.allocator, text) catch {};
+        self.authorize.observe(text);
     }
 
     fn openUrl(_: ?*anyopaque, _: Allocator, _: []const u8) bool {
@@ -1184,23 +1453,8 @@ test "device login polls through pending and slow_down, then stores the session"
     const def = registry.byKey("xai").?;
 
     var steps = [_]Step{
-        .{
-            .method = .get,
-            .url = "https://auth.x.ai/.well-known/openid-configuration",
-            .body = "{\"issuer\":\"https://auth.x.ai\"," ++
-                "\"device_authorization_endpoint\":\"https://auth.x.ai/oauth2/device/code\"," ++
-                "\"token_endpoint\":\"https://auth.x.ai/oauth2/token\"}",
-        },
-        .{
-            .method = .post_form,
-            .url = "https://auth.x.ai/oauth2/device/code",
-            .payload = "client_id=b1a00492-073a-47ea-816f-4c329264a828&scope=openid%20profile%20" ++
-                "email%20offline_access%20grok-cli%3Aaccess%20api%3Aaccess",
-            .body = "{\"device_code\":\"device-code\",\"user_code\":\"ABCD-EFGH\"," ++
-                "\"verification_uri\":\"https://x.ai/device\"," ++
-                "\"verification_uri_complete\":\"https://x.ai/device?code=ABCD-EFGH\"," ++
-                "\"expires_in\":600,\"interval\":1}",
-        },
+        xai_discovery_step,
+        xai_device_step,
         .{
             .method = .post_form,
             .url = "https://auth.x.ai/oauth2/token",
@@ -1212,11 +1466,7 @@ test "device login polls through pending and slow_down, then stores the session"
             .disposition = .rejected,
             .body = "{\"error\":\"slow_down\"}",
         },
-        .{
-            .method = .post_form,
-            .body = "{\"access_token\":\"xai-access\",\"refresh_token\":\"xai-refresh\"," ++
-                "\"expires_in\":3600,\"scope\":\"openid api:access\",\"token_type\":\"Bearer\"}",
-        },
+        .{ .method = .post_form, .body = xai_token_body },
     };
     var transport = ScriptedTransport{ .steps = &steps };
 
@@ -1257,7 +1507,121 @@ test "device login polls through pending and slow_down, then stores the session"
     try testing.expectEqual(@as(i64, 8000 + 3600 * 1000), stored.expires_at_ms);
 }
 
-test "device login refuses a discovery document that leaves the issuer domain" {
+test "begin device login only discovers and requests, without waiting or printing" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("xai").?;
+
+    var steps = [_]Step{ xai_discovery_step, xai_device_step, .{
+        .body = "{\"access_token\":\"never-reached\"}",
+    } };
+    var transport = ScriptedTransport{ .steps = &steps };
+    var env = TestEnv{};
+    defer env.deinit();
+
+    var pending = try beginDeviceLoginWith(alloc, transport.provider(), def, env.deps());
+    defer pending.deinit(alloc);
+
+    // Exactly two round trips: discovery and the device authorization request.
+    try testing.expect(transport.mismatch == null);
+    try testing.expectEqual(@as(usize, 2), transport.index);
+    // Nothing waited, nothing printed, nothing stored.
+    try testing.expectEqual(@as(usize, 0), env.sleep_count);
+    try testing.expectEqual(@as(usize, 0), env.messages.items.len);
+    try testing.expectEqual(@as(usize, 0), env.saves);
+
+    try testing.expectEqualStrings("https://x.ai/device?code=ABCD-EFGH", pending.verification_url);
+    try testing.expectEqualStrings("ABCD-EFGH", pending.user_code);
+    try testing.expectEqualStrings("device-code", pending.device_code);
+    try testing.expectEqualStrings("https://auth.x.ai/oauth2/token", pending.metadata.token_endpoint);
+    try testing.expectEqual(@as(u64, 1000), pending.interval_ms);
+    try testing.expectEqual(@as(i64, 600_000), pending.expires_at_ms);
+}
+
+test "begin device login falls back to the plain verification uri" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("xai").?;
+
+    var steps = [_]Step{ xai_discovery_step, .{
+        .body = "{\"device_code\":\"device-code\",\"user_code\":\"ABCD-EFGH\"," ++
+            "\"verification_uri\":\"https://x.ai/device\",\"expires_in\":600,\"interval\":7}",
+    } };
+    var transport = ScriptedTransport{ .steps = &steps };
+    var env = TestEnv{};
+    defer env.deinit();
+
+    var pending = try beginDeviceLoginWith(alloc, transport.provider(), def, env.deps());
+    defer pending.deinit(alloc);
+    try testing.expectEqualStrings("https://x.ai/device", pending.verification_url);
+    try testing.expectEqual(@as(u64, 7000), pending.interval_ms);
+}
+
+test "await device login polls to approval and persists without printing" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("xai").?;
+
+    var steps = [_]Step{
+        xai_discovery_step,
+        xai_device_step,
+        .{ .disposition = .rejected, .body = "{\"error\":\"authorization_pending\"}" },
+        .{ .disposition = .rejected, .body = "{\"error\":\"slow_down\"}" },
+        .{ .method = .post_form, .url = "https://auth.x.ai/oauth2/token", .body = xai_token_body },
+    };
+    var transport = ScriptedTransport{ .steps = &steps };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = try openTestProfileDir(&tmp);
+    defer dir.close();
+    var env = TestEnv{ .dir = &dir };
+    defer env.deinit();
+
+    var pending = try beginDeviceLoginWith(alloc, transport.provider(), def, env.deps());
+    defer pending.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), env.sleep_count);
+
+    try awaitDeviceLoginWith(alloc, transport.provider(), def, &pending, env.deps());
+
+    try testing.expect(transport.mismatch == null);
+    try testing.expectEqual(@as(usize, steps.len), transport.index);
+    // The waiting phase owns the whole terminal silence contract.
+    try testing.expectEqual(@as(usize, 0), env.messages.items.len);
+    // slow_down grew the interval on the pending value, where a caller can see it.
+    try testing.expectEqual(@as(u64, 6000), pending.interval_ms);
+    try testing.expectEqual(@as(usize, 3), env.sleep_count);
+    try testing.expectEqual(@as(u64, 1000), env.sleeps[0]);
+    try testing.expectEqual(@as(u64, 1000), env.sleeps[1]);
+    try testing.expectEqual(@as(u64, 6000), env.sleeps[2]);
+
+    try testing.expectEqual(@as(usize, 1), env.saves);
+    var stored = (try auth_store.loadFromDir(alloc, &dir.dir, "xai")).?;
+    defer stored.deinit(alloc);
+    try testing.expectEqualStrings("xai-access", stored.access_token);
+    try testing.expectEqualStrings("https://auth.x.ai/oauth2/token", stored.token_url);
+}
+
+test "await device login stops once the device code window closes" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("xai").?;
+
+    var steps = [_]Step{ xai_discovery_step, xai_device_step };
+    var transport = ScriptedTransport{ .steps = &steps };
+    var env = TestEnv{};
+    defer env.deinit();
+
+    var pending = try beginDeviceLoginWith(alloc, transport.provider(), def, env.deps());
+    defer pending.deinit(alloc);
+
+    env.now = pending.expires_at_ms;
+    try testing.expectError(
+        FlowError.DeviceCodeExpired,
+        awaitDeviceLoginWith(alloc, transport.provider(), def, &pending, env.deps()),
+    );
+    // The script has no poll step, so a request here would have failed loudly.
+    try testing.expectEqual(@as(usize, 2), transport.index);
+    try testing.expectEqual(@as(usize, 0), env.saves);
+}
+
+test "begin device login refuses a discovery document that leaves the issuer domain" {
     const alloc = testing.allocator;
     const def = registry.byKey("xai").?;
 
@@ -1270,6 +1634,12 @@ test "device login refuses a discovery document that leaves the issuer domain" {
     var env = TestEnv{};
     defer env.deinit();
 
+    try testing.expectError(
+        FlowError.UntrustedOAuthEndpoint,
+        beginDeviceLoginWith(alloc, transport.provider(), def, env.deps()),
+    );
+    // The composed flow rejects it for the same reason.
+    transport.index = 0;
     try testing.expectError(
         FlowError.UntrustedOAuthEndpoint,
         runLoginWith(alloc, transport.provider(), def, env.deps()),
@@ -1371,10 +1741,17 @@ test "callback request line parsing extracts code, state, and errors" {
     );
 }
 
+/// Stands in for the browser: connects to the loopback listener and sends one
+/// callback request. Runs on its own thread with its own `Io` backend, the way
+/// `login_flow`'s loopback fixture does.
 const CallbackClient = struct {
     io_backend: std.Io.Threaded = .init_single_threaded,
-    port: u16,
-    request: []const u8,
+    port: u16 = 0,
+    request: []const u8 = "",
+    /// When set, the port and the state come from the printed authorize URL
+    /// instead of being known up front.
+    probe: ?*AuthorizeProbe = null,
+    code: []const u8 = "pkce-code",
     failure: ?anyerror = null,
 
     fn run(self: *CallbackClient) void {
@@ -1385,13 +1762,32 @@ const CallbackClient = struct {
 
     fn runFallible(self: *CallbackClient) !void {
         const zio = self.io_backend.io();
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.port) };
+        var port = self.port;
+        var request = self.request;
+        var request_buffer: [512]u8 = undefined;
+        if (self.probe) |probe| {
+            var waited_ms: usize = 0;
+            while (probe.port.load(.acquire) == 0) {
+                if (waited_ms >= 10_000) return error.TestAuthorizeUrlNeverArrived;
+                zio.sleep(.fromMilliseconds(1), .real) catch {};
+                waited_ms += 1;
+            }
+            port = probe.port.load(.acquire);
+            request = try std.fmt.bufPrint(
+                &request_buffer,
+                "GET /auth/callback?code={s}&state={s} HTTP/1.1\r\n" ++
+                    "Host: localhost\r\nConnection: close\r\n\r\n",
+                .{ self.code, probe.state() },
+            );
+        }
+
+        const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
         var stream = try address.connect(zio, .{ .mode = .stream });
         defer stream.close(zio);
 
         var write_buffer: [512]u8 = undefined;
         var writer = stream.writer(zio, &write_buffer);
-        try writer.interface.writeAll(self.request);
+        try writer.interface.writeAll(request);
         try writer.interface.flush();
 
         var read_buffer: [1024]u8 = undefined;
@@ -1426,6 +1822,258 @@ test "loopback listener times out without a callback" {
     defer listener.deinit();
     try testing.expect(listener.port() != 0);
     try testing.expectError(FlowError.CallbackTimedOut, listener.awaitCallback(alloc, 1));
+}
+
+/// Builds the callback request a browser would send back to the listener.
+fn callbackRequest(alloc: Allocator, query: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "GET /auth/callback?{s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        .{query},
+    );
+}
+
+test "begin pkce login binds the listener and composes the authorize url" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("openai").?;
+
+    var pending = try beginPkceLoginOnPort(alloc, def, 0);
+    defer pending.deinit(alloc);
+
+    const port = pending.callbackPort();
+    try testing.expect(port != 0);
+
+    const expected_redirect = try std.fmt.allocPrint(alloc, "http://localhost:{d}/auth/callback", .{port});
+    defer alloc.free(expected_redirect);
+    try testing.expectEqualStrings(expected_redirect, pending.redirect_uri);
+
+    // The URL carries the challenge for the verifier the pending value kept.
+    const challenge = pkceChallenge(&pending.verifier);
+    try testing.expect(std.mem.find(u8, pending.authorize_url, &challenge) != null);
+    try testing.expect(std.mem.find(u8, pending.authorize_url, pending.state[0..]) != null);
+    try testing.expect(std.mem.startsWith(u8, pending.authorize_url, def.oauth.authorize_url));
+    try testing.expect(std.mem.find(u8, pending.authorize_url, "code_challenge_method=S256") != null);
+    try testing.expect(std.mem.find(u8, pending.authorize_url, "codex_cli_simplified_flow=true") != null);
+
+    // Two pendings never share PKCE material or the same bound port.
+    var other = try beginPkceLoginOnPort(alloc, def, 0);
+    defer other.deinit(alloc);
+    try testing.expect(!std.mem.eql(u8, &pending.verifier, &other.verifier));
+    try testing.expect(!std.mem.eql(u8, &pending.state, &other.state));
+    try testing.expect(pending.callbackPort() != other.callbackPort());
+}
+
+test "begin pkce login reports a busy callback port" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("openai").?;
+
+    var holder = try beginPkceLoginOnPort(alloc, def, 0);
+    defer holder.deinit(alloc);
+
+    try testing.expectError(
+        FlowError.CallbackPortBusy,
+        beginPkceLoginOnPort(alloc, def, holder.callbackPort()),
+    );
+}
+
+test "await pkce login exchanges the callback code and persists the session" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("openai").?;
+
+    var pending = try beginPkceLoginOnPort(alloc, def, 0);
+    defer pending.deinit(alloc);
+
+    const id_token = try craftJwt(
+        alloc,
+        "{\"" ++ openai_auth_claim ++ "\":{\"chatgpt_account_id\":\"acct_pkce\"}}",
+    );
+    defer alloc.free(id_token);
+    const token_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"access_token\":\"pkce-access\",\"refresh_token\":\"pkce-refresh\"," ++
+            "\"id_token\":\"{s}\",\"expires_in\":3600,\"token_type\":\"Bearer\"}}",
+        .{id_token},
+    );
+    defer alloc.free(token_body);
+
+    var steps = [_]Step{.{
+        .method = .post_form,
+        .url = "https://auth.openai.com/oauth/token",
+        .body = token_body,
+    }};
+    var transport = ScriptedTransport{ .steps = &steps };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = try openTestProfileDir(&tmp);
+    defer dir.close();
+    var env = TestEnv{ .now = 5_000, .dir = &dir };
+    defer env.deinit();
+
+    const query = try std.fmt.allocPrint(alloc, "code=pkce-code&state={s}", .{pending.state[0..]});
+    defer alloc.free(query);
+    const request = try callbackRequest(alloc, query);
+    defer alloc.free(request);
+
+    var client = CallbackClient{ .port = pending.callbackPort(), .request = request };
+    const thread = try std.Thread.spawn(.{}, CallbackClient.run, .{&client});
+    defer thread.join();
+
+    const account_id_present = try awaitPkceLoginWith(
+        alloc,
+        transport.provider(),
+        def,
+        &pending,
+        env.deps(),
+    );
+    try testing.expect(account_id_present);
+    try testing.expect(transport.mismatch == null);
+    try testing.expectEqual(@as(usize, 0), env.messages.items.len);
+    // The listener is consumed, so the deferred deinit must not close it twice.
+    try testing.expect(pending.listener == null);
+
+    const payload = transport.lastPayload();
+    try testing.expect(std.mem.find(u8, payload, "grant_type=authorization_code&code=pkce-code") != null);
+    try testing.expect(std.mem.find(u8, payload, pending.verifier[0..]) != null);
+    try testing.expect(std.mem.find(u8, payload, "client_id=app_EMoamEEZ73f0CkXaXp7hrann") != null);
+
+    var stored = (try auth_store.loadFromDir(alloc, &dir.dir, "openai")).?;
+    defer stored.deinit(alloc);
+    try testing.expectEqualStrings("pkce-access", stored.access_token);
+    try testing.expectEqualStrings("pkce-refresh", stored.refresh_token.?);
+    try testing.expectEqualStrings("acct_pkce", stored.account_id.?);
+    try testing.expectEqualStrings("https://auth.openai.com/oauth/token", stored.token_url);
+    try testing.expectEqual(@as(i64, 5_000 + 3_600_000), stored.expires_at_ms);
+
+    // A second wait has nothing left to wait on.
+    try testing.expectError(FlowError.PendingAlreadyConsumed, awaitPkceLoginWith(
+        alloc,
+        transport.provider(),
+        def,
+        &pending,
+        env.deps(),
+    ));
+}
+
+test "await pkce login keeps the browser failure detail for the caller" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("openai").?;
+    var transport = RejectingTransport{};
+
+    var pending = try beginPkceLoginOnPort(alloc, def, 0);
+    defer pending.deinit(alloc);
+
+    const request = try callbackRequest(
+        alloc,
+        "error=access_denied&error_description=User+declined+the+request",
+    );
+    defer alloc.free(request);
+
+    var client = CallbackClient{ .port = pending.callbackPort(), .request = request };
+    const thread = try std.Thread.spawn(.{}, CallbackClient.run, .{&client});
+    defer thread.join();
+
+    var env = TestEnv{};
+    defer env.deinit();
+    try testing.expectError(FlowError.AuthorizationDenied, awaitPkceLoginWith(
+        alloc,
+        transport.provider(),
+        def,
+        &pending,
+        env.deps(),
+    ));
+    try testing.expectEqualStrings("User declined the request", pending.failure_detail.?);
+    try testing.expectEqual(@as(usize, 0), transport.calls);
+    try testing.expectEqual(@as(usize, 0), env.saves);
+}
+
+test "pkce pending deinit is safe after the waiting phase consumed the listener" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("openai").?;
+
+    var pending = try beginPkceLoginOnPort(alloc, def, 0);
+    try testing.expect(pending.listener != null);
+
+    // Simulates what the waiting phase does with the listener.
+    var listener = pending.listener.?;
+    pending.listener = null;
+    listener.deinit();
+
+    pending.deinit(alloc);
+    // A second release must be a no-op, so a UI can always defer it.
+    pending.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), pending.authorize_url.len);
+    try testing.expect(pending.listener == null);
+}
+
+test "runLogin recomposes the pkce phases and prints the authorize url" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("openai").?;
+
+    var steps = [_]Step{.{
+        .method = .post_form,
+        .url = "https://auth.openai.com/oauth/token",
+        .body = "{\"access_token\":\"composed-access\",\"refresh_token\":\"composed-refresh\"," ++
+            "\"expires_in\":3600,\"token_type\":\"Bearer\"}",
+    }};
+    var transport = ScriptedTransport{ .steps = &steps };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir = try openTestProfileDir(&tmp);
+    defer dir.close();
+    var env = TestEnv{ .dir = &dir };
+    defer env.deinit();
+
+    var deps = env.deps();
+    deps.callback_port = 0;
+
+    var client = CallbackClient{ .probe = &env.authorize, .code = "composed-code" };
+    const thread = try std.Thread.spawn(.{}, CallbackClient.run, .{&client});
+    defer thread.join();
+
+    const outcome = try runLoginWith(alloc, transport.provider(), def, deps);
+    try testing.expect(client.failure == null);
+    try testing.expect(transport.mismatch == null);
+    try testing.expectEqualStrings("OpenAI", outcome.provider_label);
+    // No id token in the response, so the account id is reported as missing.
+    try testing.expect(!outcome.account_id_present);
+
+    try testing.expect(std.mem.find(u8, env.messages.items, def.oauth.authorize_url) != null);
+    try testing.expect(std.mem.find(u8, env.messages.items, "Signed in to OpenAI.") != null);
+    try testing.expect(std.mem.find(u8, env.messages.items, "account id was missing") != null);
+
+    var stored = (try auth_store.loadFromDir(alloc, &dir.dir, "openai")).?;
+    defer stored.deinit(alloc);
+    try testing.expectEqualStrings("composed-access", stored.access_token);
+    try testing.expect(stored.account_id == null);
+}
+
+test "await pkce login refuses a callback with the wrong state" {
+    const alloc = testing.allocator;
+    const def = registry.byKey("openai").?;
+    var transport = RejectingTransport{};
+
+    var pending = try beginPkceLoginOnPort(alloc, def, 0);
+    defer pending.deinit(alloc);
+
+    const request = try callbackRequest(alloc, "code=pkce-code&state=not-the-state");
+    defer alloc.free(request);
+
+    var client = CallbackClient{ .port = pending.callbackPort(), .request = request };
+    const thread = try std.Thread.spawn(.{}, CallbackClient.run, .{&client});
+    defer thread.join();
+
+    var env = TestEnv{};
+    defer env.deinit();
+    try testing.expectError(FlowError.CallbackStateMismatch, awaitPkceLoginWith(
+        alloc,
+        transport.provider(),
+        def,
+        &pending,
+        env.deps(),
+    ));
+    try testing.expectEqual(@as(usize, 0), transport.calls);
 }
 
 test "refresh is skipped while the session is outside the skew window" {

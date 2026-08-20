@@ -356,6 +356,9 @@ tmuxTest(
       (pane) =>
         pane.includes("Setup") &&
         pane.includes("Sign in with Vercel") &&
+        // omfx: direct provider sign-in options.
+        pane.includes("Sign in with OpenAI (ChatGPT)") &&
+        pane.includes("Sign in with Grok (xAI)") &&
         pane.includes("API key") &&
         pane.includes("Change team") &&
         pane.includes("Switch credential"),
@@ -369,7 +372,10 @@ tmuxTest(
     await session.sendKeys("Escape");
     await session.waitForText("Switch credential", TIMEOUT);
 
-    await session.sendKeys("Down");
+    // omfx: skip past the two direct provider sign-ins to reach the API key.
+    for (let index = 0; index < 3; index += 1) {
+      await session.sendKeys("Down");
+    }
     await session.sendKeys("Enter");
     const apiKey = await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
     expect(apiKey).toContain("Saves to");
@@ -450,7 +456,8 @@ async function waitForTrace(tracePath: string, needle: string): Promise<void> {
 }
 
 async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> {
-  for (let index = 0; index < 3; index += 1) {
+  // omfx: two direct provider sign-ins sit between login and setup.
+  for (let index = 0; index < 5; index += 1) {
     await pickerSession.sendKeys("Down");
   }
   await pickerSession.sendKeys("Enter");
@@ -606,8 +613,10 @@ tmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("Change team", TIMEOUT);
-    await session.sendKeys("Down");
-    await session.sendKeys("Down");
+    // omfx: two direct provider sign-ins sit between login and setup.
+    for (let index = 0; index < 4; index += 1) {
+      await session.sendKeys("Down");
+    }
     await session.sendKeys("Enter");
     await session.waitForText("Choose a Vercel team", TIMEOUT);
     await session.sendKeys("Enter");

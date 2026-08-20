@@ -1,6 +1,8 @@
 const std = @import("std");
 const api_key_validator = @import("api_key_validator.zig");
 const credentials = @import("credentials.zig");
+// omfx: direct provider session presence for picker descriptions.
+const omfx_auth_store = @import("../providers/auth_store.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("login_flow.zig");
 const oauth_transport = @import("oauth_transport.zig");
@@ -118,6 +120,9 @@ pub fn refreshFxLoginToken(
 
 pub const AcquisitionAction = enum {
     login,
+    // omfx: direct provider sign-in (subscription OAuth).
+    login_openai,
+    login_grok,
     setup,
     change_team,
     switch_credential,
@@ -344,7 +349,8 @@ pub const PickerView = struct {
 
     pub fn choiceCount(self: PickerView) usize {
         return switch (self.stage) {
-            .root => if (self.include_skip) 2 else 4,
+            // omfx: two extra direct provider sign-in options in both roots.
+            .root => if (self.include_skip) 4 else 6,
             .sign_in, .api_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -359,17 +365,22 @@ pub const PickerView = struct {
 
     pub fn choiceAt(self: PickerView, index: usize) ?Choice {
         return switch (self.stage) {
+            // omfx: direct provider options follow the Vercel sign-in.
             .root => if (self.include_skip)
                 switch (index) {
                     0 => .{ .action = .login },
-                    1 => .{ .action = .setup },
+                    1 => .{ .action = .login_openai },
+                    2 => .{ .action = .login_grok },
+                    3 => .{ .action = .setup },
                     else => null,
                 }
             else switch (index) {
                 0 => .{ .action = .login },
-                1 => .{ .action = .setup },
-                2 => .{ .action = .change_team },
-                3 => .{ .action = .switch_credential },
+                1 => .{ .action = .login_openai },
+                2 => .{ .action = .login_grok },
+                3 => .{ .action = .setup },
+                4 => .{ .action = .change_team },
+                5 => .{ .action = .switch_credential },
                 else => null,
             },
             .sign_in, .api_key => null,
@@ -410,6 +421,9 @@ pub const PickerView = struct {
             .source => |source| credentials.sourceLabel(source),
             .action => |action| switch (action) {
                 .login => "Sign in with Vercel",
+                // omfx: direct provider sign-in labels.
+                .login_openai => "Sign in with OpenAI (ChatGPT)",
+                .login_grok => "Sign in with Grok (xAI)",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
@@ -424,6 +438,9 @@ pub const PickerView = struct {
             .source => |source| if (self.active_source == source) "current" else "available",
             .action => |action| switch (action) {
                 .login, .setup, .switch_credential => "",
+                // omfx: show when a direct provider session is already saved.
+                .login_openai => if (omfx_auth_store.exists("openai")) "signed in" else "",
+                .login_grok => if (omfx_auth_store.exists("xai")) "signed in" else "",
                 .automatic => "use normal precedence",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
@@ -1036,6 +1053,8 @@ pub const Runtime = struct {
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
                     .login => self.closePicker(alloc),
+                    // omfx: provider sign-ins run outside the picker stages.
+                    .login_openai, .login_grok => self.closePicker(alloc),
                 },
                 .team => unreachable,
             },
@@ -1945,16 +1964,22 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
-    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
-    try std.testing.expect(picker.choiceAt(4) == null);
+    // omfx: the hub also offers the direct provider sign-ins.
+    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
+    try std.testing.expect(picker.choiceAt(6) == null);
 }
 
-test "auth picker navigation wraps across the four hub actions" {
+test "auth picker navigation wraps across the hub actions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
     runtime.openPicker(alloc);
 
+    // omfx: the direct provider sign-ins sit between login and setup.
+    try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .login_openai }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .login_grok }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
@@ -1988,23 +2013,27 @@ test "auth picker without credentials exposes acquisition actions" {
     try std.testing.expect(picker.active_source == null);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
+    // omfx: the hub also offers the direct provider sign-ins.
+    try std.testing.expectEqual(@as(usize, 6), picker.choiceCount());
     try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
 
-test "auth onboarding picker exposes only the two setup paths" {
+test "auth onboarding picker exposes only the sign-in paths" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.openOnboardingPicker(alloc);
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 2), picker.choiceCount());
+    // omfx: onboarding also offers the direct provider sign-ins.
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
-    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(1).?));
-    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(1).?));
-    try std.testing.expect(picker.choiceAt(2) == null);
+    try std.testing.expect((Choice{ .action = .login_openai }).eql(picker.choiceAt(1).?));
+    try std.testing.expect((Choice{ .action = .login_grok }).eql(picker.choiceAt(2).?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(3).?));
+    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(3).?));
+    try std.testing.expect(picker.choiceAt(4) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {

@@ -5,8 +5,11 @@ const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
-// omfx: direct provider credentials can satisfy the prompt credential gate.
+// omfx: direct provider credentials can satisfy the prompt credential gate,
+// and the picker dispatches provider sign-ins to the fork login driver.
 const omfx_provider_credentials = @import("../providers/provider_credentials.zig");
+const omfx_registry = @import("../providers/registry.zig");
+const omfx_tui_login = @import("../providers/tui_login.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const types = @import("../shared/types.zig");
@@ -133,6 +136,9 @@ pub fn Runtime(comptime App: type) type {
                 .source => |source| try applySourceChoice(app, source),
                 .action => |action| switch (action) {
                     .login => try beginSignIn(app, true),
+                    // omfx: direct provider sign-in via the fork login driver.
+                    .login_openai => try beginProviderSignIn(app, omfx_registry.byKey("openai").?),
+                    .login_grok => try beginProviderSignIn(app, omfx_registry.byKey("xai").?),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -192,8 +198,64 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        // omfx: runs the fast phase of a direct provider OAuth flow, shows
+        // the URL, and opens the browser; a worker thread waits for approval.
+        fn beginProviderSignIn(app: *App, def: *const omfx_registry.Def) !void {
+            try app.flushBeforeBlockingExternalWork();
+            const started = omfx_tui_login.start(
+                app.alloc,
+                app.auth.oauthTransport(),
+                def,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("auth", "provider sign-in start failed provider={s} err={s}", .{ def.key, @errorName(err) });
+                const body = try std.fmt.allocPrint(
+                    app.alloc,
+                    "Could not start the {s} sign-in ({s}).",
+                    .{ def.label, @errorName(err) },
+                );
+                defer app.alloc.free(body);
+                try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
+                return;
+            };
+            const outcome = started orelse {
+                try app.writeDomainNotice(.{
+                    .topic = "auth",
+                    .tone = .warning,
+                    .body = "A provider sign-in is already in progress.",
+                }, true);
+                return;
+            };
+            defer app.alloc.free(outcome.notice);
+            try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = outcome.notice }, true);
+            if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+                if (!(app.urlOpener().open(app.alloc, outcome.browser_url) catch false)) {
+                    debug_trace.logf("auth", "provider sign-in browser launcher failed", .{});
+                }
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
+        // omfx: surface background direct-provider sign-in outcomes.
+        fn collectProviderSignInFacts(app: *App) !void {
+            const outcome = (try omfx_tui_login.takeOutcome(app.alloc)) orelse return;
+            switch (outcome) {
+                .succeeded => |body| {
+                    defer app.alloc.free(body);
+                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .neutral, .body = body }, true);
+                    app.auth.closePicker(app.alloc);
+                },
+                .failed => |body| {
+                    defer app.alloc.free(body);
+                    try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
+                },
+            }
+            app.shell.render_requests.request(.footer);
+        }
+
         pub fn collectSignInFacts(app: *App) !void {
             if (comptime !oauthAuthEnabled(App)) return;
+            try collectProviderSignInFacts(app);
             app.auth.pulseSignIn(app.alloc);
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},

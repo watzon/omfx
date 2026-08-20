@@ -15,6 +15,8 @@
 const std = @import("std");
 
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
+const io_mod = @import("../core/shared/io.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const types = @import("../core/shared/types.zig");
 
@@ -27,6 +29,30 @@ const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
 // Request builders
 // ---------------------------------------------------------------------------
 
+/// Structured-output contract, mirroring
+/// `agent_stream_provider.StructuredResponseFormat`.
+pub const StructuredResponseFormat = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    schema_json: []const u8,
+};
+
+/// Every request knob both direct wires understand. The provider router owns
+/// which combination it sends; the builders only enforce wire-level invariants.
+pub const BuildOptions = struct {
+    provider_options: model_capabilities.ResolvedProviderOptions = .{},
+    tool_choice: types.ToolChoice = .auto,
+    max_output_tokens: ?u32 = null,
+    /// Requests JSON-schema constrained output.
+    response_format: ?StructuredResponseFormat = null,
+    /// Pre-verified image payloads for the final user message. When set, that
+    /// message must be a user message that carries no inline attachments, the
+    /// same invariant the gateway verified-images builder enforces.
+    verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
+    /// Forces exactly this function call, overriding `tool_choice`.
+    required_tool_name: ?[]const u8 = null,
+};
+
 /// Builds a streaming OpenAI Responses API request body. `model` is the
 /// provider-native id, `serialized_tools` is the gateway tool array
 /// (`[{"name":..,"description":..,"inputSchema":{..}}]`). The caller owns the
@@ -36,11 +62,9 @@ pub fn buildResponsesRequestBody(
     model: []const u8,
     serialized_tools: []const u8,
     messages: []const types.ChatMessage,
-    provider_options: model_capabilities.ResolvedProviderOptions,
-    tool_choice: types.ToolChoice,
-    max_output_tokens: ?u32,
+    options: BuildOptions,
 ) ![]u8 {
-    try rejectImageAttachments(messages);
+    const verified_index = try verifiedImageIndex(messages, options.verified_images);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -58,14 +82,17 @@ pub fn buildResponsesRequestBody(
 
     try writer.writeAll(",\"input\":[");
     var wrote_input = false;
-    for (messages) |message| {
+    for (messages, 0..) |message, i| {
         switch (message.role) {
             .system => {},
             .user => {
                 if (wrote_input) try writer.writeByte(',');
-                try writer.writeAll("{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":");
-                try std.json.Stringify.value(message.content orelse "", .{}, writer);
-                try writer.writeAll("}]}");
+                try writeResponsesUserMessage(
+                    alloc,
+                    writer,
+                    message,
+                    if (verified_index == i) options.verified_images else null,
+                );
                 wrote_input = true;
             },
             .assistant => {
@@ -107,14 +134,21 @@ pub fn buildResponsesRequestBody(
     try writeResponsesTools(alloc, writer, serialized_tools);
 
     try writer.writeAll(",\"tool_choice\":");
-    try std.json.Stringify.value(tool_choice.label(), .{}, writer);
+    if (options.required_tool_name) |name| {
+        if (name.len == 0) return error.InvalidRequiredToolName;
+        try writer.writeAll("{\"type\":\"function\",\"name\":");
+        try std.json.Stringify.value(name, .{}, writer);
+        try writer.writeByte('}');
+    } else {
+        try std.json.Stringify.value(options.tool_choice.label(), .{}, writer);
+    }
 
-    if (provider_options.parallel_tool_calls) |parallel| {
+    if (options.provider_options.parallel_tool_calls) |parallel| {
         try writer.writeAll(",\"parallel_tool_calls\":");
         try writer.writeAll(if (parallel) "true" else "false");
     }
 
-    if (provider_options.reasoning) |*reasoning| {
+    if (options.provider_options.reasoning) |*reasoning| {
         if (namedReasoningEffort(reasoning)) |effort| {
             try writer.writeAll(",\"reasoning\":{\"effort\":");
             try std.json.Stringify.value(effort, .{}, writer);
@@ -122,7 +156,21 @@ pub fn buildResponsesRequestBody(
         }
     }
 
-    if (max_output_tokens) |value| {
+    if (options.response_format) |format| {
+        var schema = try parseStructuredSchema(alloc, format.schema_json);
+        defer schema.deinit();
+        try writer.writeAll(",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":");
+        try std.json.Stringify.value(format.name, .{}, writer);
+        if (format.description.len > 0) {
+            try writer.writeAll(",\"description\":");
+            try std.json.Stringify.value(format.description, .{}, writer);
+        }
+        try writer.writeAll(",\"strict\":false,\"schema\":");
+        try std.json.Stringify.value(schema.value, .{}, writer);
+        try writer.writeAll("}}");
+    }
+
+    if (options.max_output_tokens) |value| {
         try writer.print(",\"max_output_tokens\":{d}", .{value});
     }
 
@@ -137,11 +185,9 @@ pub fn buildChatCompletionsRequestBody(
     model: []const u8,
     serialized_tools: []const u8,
     messages: []const types.ChatMessage,
-    provider_options: model_capabilities.ResolvedProviderOptions,
-    tool_choice: types.ToolChoice,
-    max_output_tokens: ?u32,
+    options: BuildOptions,
 ) ![]u8 {
-    try rejectImageAttachments(messages);
+    const verified_index = try verifiedImageIndex(messages, options.verified_images);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -154,13 +200,17 @@ pub fn buildChatCompletionsRequestBody(
     for (messages, 0..) |message, i| {
         if (i > 0) try writer.writeByte(',');
         switch (message.role) {
-            .system, .user => {
-                try writer.writeAll("{\"role\":");
-                try std.json.Stringify.value(chatRoleName(message.role), .{}, writer);
-                try writer.writeAll(",\"content\":");
+            .system => {
+                try writer.writeAll("{\"role\":\"system\",\"content\":");
                 try std.json.Stringify.value(message.content orelse "", .{}, writer);
                 try writer.writeByte('}');
             },
+            .user => try writeChatCompletionsUserMessage(
+                alloc,
+                writer,
+                message,
+                if (verified_index == i) options.verified_images else null,
+            ),
             .assistant => {
                 try writer.writeAll("{\"role\":\"assistant\"");
                 if (message.content) |content| {
@@ -198,21 +248,42 @@ pub fn buildChatCompletionsRequestBody(
     try writeChatCompletionsTools(alloc, writer, serialized_tools);
 
     try writer.writeAll(",\"tool_choice\":");
-    try std.json.Stringify.value(tool_choice.label(), .{}, writer);
+    if (options.required_tool_name) |name| {
+        if (name.len == 0) return error.InvalidRequiredToolName;
+        try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
+        try std.json.Stringify.value(name, .{}, writer);
+        try writer.writeAll("}}");
+    } else {
+        try std.json.Stringify.value(options.tool_choice.label(), .{}, writer);
+    }
 
-    if (provider_options.parallel_tool_calls) |parallel| {
+    if (options.provider_options.parallel_tool_calls) |parallel| {
         try writer.writeAll(",\"parallel_tool_calls\":");
         try writer.writeAll(if (parallel) "true" else "false");
     }
 
-    if (provider_options.reasoning) |*reasoning| {
+    if (options.provider_options.reasoning) |*reasoning| {
         if (namedReasoningEffort(reasoning)) |effort| {
             try writer.writeAll(",\"reasoning_effort\":");
             try std.json.Stringify.value(effort, .{}, writer);
         }
     }
 
-    if (max_output_tokens) |value| {
+    if (options.response_format) |format| {
+        var schema = try parseStructuredSchema(alloc, format.schema_json);
+        defer schema.deinit();
+        try writer.writeAll(",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":");
+        try std.json.Stringify.value(format.name, .{}, writer);
+        if (format.description.len > 0) {
+            try writer.writeAll(",\"description\":");
+            try std.json.Stringify.value(format.description, .{}, writer);
+        }
+        try writer.writeAll(",\"strict\":false,\"schema\":");
+        try std.json.Stringify.value(schema.value, .{}, writer);
+        try writer.writeAll("}}");
+    }
+
+    if (options.max_output_tokens) |value| {
         try writer.print(",\"max_tokens\":{d}", .{value});
     }
 
@@ -220,19 +291,163 @@ pub fn buildChatCompletionsRequestBody(
     return try out.toOwnedSlice();
 }
 
-fn chatRoleName(role: types.ChatRole) []const u8 {
-    return switch (role) {
-        .system => "system",
-        .user => "user",
-        .assistant => "assistant",
-        .tool => "tool",
+// ---------------------------------------------------------------------------
+// Message content, images, and structured output
+// ---------------------------------------------------------------------------
+
+/// Verified snapshots replace the inline attachments of the final user message,
+/// matching `gateway_json.buildGatewayRequestBodyWithVerifiedImagesAndBudget`.
+fn verifiedImageIndex(
+    messages: []const types.ChatMessage,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+) error{InvalidRequestHistory}!?usize {
+    if (verified_images == null) return null;
+    if (messages.len == 0) return error.InvalidRequestHistory;
+    const last = messages[messages.len - 1];
+    if (last.role != .user or last.images.len != 0) return error.InvalidRequestHistory;
+    return messages.len - 1;
+}
+
+fn messageHasImages(
+    message: types.ChatMessage,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+) bool {
+    if (verified_images) |snapshots| return snapshots.len > 0;
+    return message.images.len > 0;
+}
+
+/// Media types come from the image sniffing table, so anything outside the
+/// token alphabet means the attachment was tampered with.
+fn validateMediaType(media_type: []const u8) error{UnsupportedImageMediaType}!void {
+    if (media_type.len == 0 or media_type.len > 128) return error.UnsupportedImageMediaType;
+    for (media_type) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '/', '-', '+', '.' => {},
+        else => return error.UnsupportedImageMediaType,
     };
 }
 
-fn rejectImageAttachments(messages: []const types.ChatMessage) error{UnsupportedImageAttachments}!void {
-    for (messages) |message| {
-        if (message.images.len > 0) return error.UnsupportedImageAttachments;
+/// Writes a complete JSON string holding a `data:` URL. Base64 is emitted in
+/// 3-byte-aligned chunks so the encoder output concatenates cleanly.
+fn writeImageDataUrl(writer: *std.Io.Writer, media_type: []const u8, bytes: []const u8) !void {
+    try validateMediaType(media_type);
+    try writer.writeAll("\"data:");
+    try writer.writeAll(media_type);
+    try writer.writeAll(";base64,");
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = @min(offset + 3 * 1024, bytes.len);
+        try std.base64.standard.Encoder.encodeWriter(writer, bytes[offset..end]);
+        offset = end;
     }
+    try writer.writeByte('"');
+}
+
+const ImagePartWire = enum { responses, chat_completions };
+
+fn writeImagePart(
+    writer: *std.Io.Writer,
+    wire: ImagePartWire,
+    media_type: []const u8,
+    bytes: []const u8,
+) !void {
+    switch (wire) {
+        .responses => {
+            try writer.writeAll("{\"type\":\"input_image\",\"image_url\":");
+            try writeImageDataUrl(writer, media_type, bytes);
+            try writer.writeByte('}');
+        },
+        .chat_completions => {
+            try writer.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
+            try writeImageDataUrl(writer, media_type, bytes);
+            try writer.writeAll("}}");
+        },
+    }
+}
+
+/// Emits the image parts of one user message, either from pre-verified
+/// snapshots or by loading and verifying each inline attachment.
+fn writeMessageImageParts(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    wire: ImagePartWire,
+    message: types.ChatMessage,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+    wrote_part: *bool,
+) !void {
+    if (verified_images) |snapshots| {
+        for (snapshots) |snapshot| {
+            if (wrote_part.*) try writer.writeByte(',');
+            try writeImagePart(writer, wire, snapshot.media_type, snapshot.bytes);
+            wrote_part.* = true;
+        }
+        return;
+    }
+    for (message.images) |attachment| {
+        var snapshot = try image_attachments.loadVerifiedSnapshot(alloc, attachment, .{});
+        defer snapshot.deinit(alloc);
+        if (wrote_part.*) try writer.writeByte(',');
+        try writeImagePart(writer, wire, snapshot.media_type, snapshot.bytes);
+        wrote_part.* = true;
+    }
+}
+
+fn writeResponsesUserMessage(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    message: types.ChatMessage,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+) !void {
+    const content = message.content orelse "";
+    const has_images = messageHasImages(message, verified_images);
+
+    try writer.writeAll("{\"type\":\"message\",\"role\":\"user\",\"content\":[");
+    var wrote_part = false;
+    if (content.len > 0 or !has_images) {
+        try writer.writeAll("{\"type\":\"input_text\",\"text\":");
+        try std.json.Stringify.value(content, .{}, writer);
+        try writer.writeByte('}');
+        wrote_part = true;
+    }
+    try writeMessageImageParts(alloc, writer, .responses, message, verified_images, &wrote_part);
+    try writer.writeAll("]}");
+}
+
+fn writeChatCompletionsUserMessage(
+    alloc: Allocator,
+    writer: *std.Io.Writer,
+    message: types.ChatMessage,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+) !void {
+    const content = message.content orelse "";
+    if (!messageHasImages(message, verified_images)) {
+        try writer.writeAll("{\"role\":\"user\",\"content\":");
+        try std.json.Stringify.value(content, .{}, writer);
+        try writer.writeByte('}');
+        return;
+    }
+
+    try writer.writeAll("{\"role\":\"user\",\"content\":[");
+    var wrote_part = false;
+    if (content.len > 0) {
+        try writer.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(content, .{}, writer);
+        try writer.writeByte('}');
+        wrote_part = true;
+    }
+    try writeMessageImageParts(alloc, writer, .chat_completions, message, verified_images, &wrote_part);
+    try writer.writeAll("]}");
+}
+
+fn parseStructuredSchema(alloc: Allocator, schema_json: []const u8) !std.json.Parsed(std.json.Value) {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidStructuredResponseSchema,
+    };
+    if (parsed.value != .object) {
+        parsed.deinit();
+        return error.InvalidStructuredResponseSchema;
+    }
+    return parsed;
 }
 
 /// Named efforts reach the wire; `auto` and "no effort selected" stay silent so
@@ -1027,8 +1242,6 @@ test "responses request body maps every message role onto the input array" {
         sample_tools,
         &messages,
         .{},
-        .auto,
-        null,
     );
     defer alloc.free(body);
 
@@ -1083,7 +1296,7 @@ test "responses request body joins several system messages into instructions" {
         .{ .role = .user, .content = "go" },
     };
 
-    const body = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, .{}, .none, null);
+    const body = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, .{ .tool_choice = .none });
     defer alloc.free(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1104,8 +1317,6 @@ test "chat completions request body maps roles, tool calls, and tool results" {
         sample_tools,
         &messages,
         .{},
-        .auto,
-        null,
     );
     defer alloc.free(body);
 
@@ -1156,7 +1367,7 @@ test "chat completions omits assistant content when the message carries none" {
         .{ .role = .tool, .content = "ok", .tool_call_id = "c1", .tool_name = "list_dir" },
     };
 
-    const body = try buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, .{}, .auto, null);
+    const body = try buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, .{});
     defer alloc.free(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1176,8 +1387,6 @@ test "gateway tool specs transform onto both OpenAI wire shapes" {
         sample_tools,
         &messages,
         .{},
-        .auto,
-        null,
     );
     defer alloc.free(responses_body);
 
@@ -1202,8 +1411,6 @@ test "gateway tool specs transform onto both OpenAI wire shapes" {
         sample_tools,
         &messages,
         .{},
-        .auto,
-        null,
     );
     defer alloc.free(chat_body);
 
@@ -1233,9 +1440,7 @@ test "provider options reach both wires only when they are set" {
         "gpt-5.2",
         "[]",
         &messages,
-        options,
-        .auto,
-        4096,
+        .{ .provider_options = options, .max_output_tokens = 4096 },
     );
     defer alloc.free(responses_body);
     var responses_parsed = try std.json.parseFromSlice(std.json.Value, alloc, responses_body, .{});
@@ -1255,9 +1460,7 @@ test "provider options reach both wires only when they are set" {
         "grok-4",
         "[]",
         &messages,
-        options,
-        .auto,
-        2048,
+        .{ .provider_options = options, .max_output_tokens = 2048 },
     );
     defer alloc.free(chat_body);
     var chat_parsed = try std.json.parseFromSlice(std.json.Value, alloc, chat_body, .{});
@@ -1272,36 +1475,238 @@ test "automatic reasoning effort stays off both wires" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "go" }};
     const options = model_capabilities.ResolvedProviderOptions{ .reasoning = .auto };
 
-    const responses_body = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, options, .auto, null);
+    const responses_body = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, .{ .provider_options = options });
     defer alloc.free(responses_body);
     var responses_parsed = try std.json.parseFromSlice(std.json.Value, alloc, responses_body, .{});
     defer responses_parsed.deinit();
     try testing.expect(responses_parsed.value.object.get("reasoning") == null);
 
-    const chat_body = try buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, options, .auto, null);
+    const chat_body = try buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, .{ .provider_options = options });
     defer alloc.free(chat_body);
     var chat_parsed = try std.json.parseFromSlice(std.json.Value, alloc, chat_body, .{});
     defer chat_parsed.deinit();
     try testing.expect(chat_parsed.value.object.get("reasoning_effort") == null);
 }
 
-test "image attachments are rejected by both builders" {
+/// The one-pixel PNG header the image sniffer recognizes; its base64 form is
+/// asserted in the image tests below.
+const png_fixture_bytes = "\x89PNG\r\n\x1a\nabc";
+const png_fixture_base64 = "iVBORw0KGgphYmM=";
+
+test "inline message images become data-url parts on both wires" {
     const alloc = testing.allocator;
-    const images = [_]types.ImageAttachment{.{
-        .path = @constCast("/tmp/shot.png"),
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "image.png", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, png_fixture_bytes);
+    }
+
+    const image_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "image.png");
+    defer alloc.free(image_path);
+    const source = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast(image_path),
         .media_type = @constCast("image/png"),
     }};
-    const messages = [_]types.ChatMessage{
-        .{ .role = .user, .content = "look", .images = &images },
-    };
+    const images = try types.dupeImageAttachmentSlice(alloc, &source);
+    defer types.freeImageAttachmentSlice(alloc, images);
 
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    defer alloc.free(snapshot_dir);
+    try image_attachments.captureImageSnapshot(alloc, &images[0], snapshot_dir);
+
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "look", .images = images },
+    };
+    const expected_url = "data:image/png;base64," ++ png_fixture_base64;
+
+    const responses_body = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, .{});
+    defer alloc.free(responses_body);
+    var responses_parsed = try std.json.parseFromSlice(std.json.Value, alloc, responses_body, .{});
+    defer responses_parsed.deinit();
+    const responses_parts = responses_parsed.value.object
+        .get("input").?.array.items[0].object
+        .get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), responses_parts.len);
+    try testing.expectEqualStrings("input_text", responses_parts[0].object.get("type").?.string);
+    try testing.expectEqualStrings("look", responses_parts[0].object.get("text").?.string);
+    try testing.expectEqualStrings("input_image", responses_parts[1].object.get("type").?.string);
+    try testing.expectEqualStrings(expected_url, responses_parts[1].object.get("image_url").?.string);
+
+    const chat_body = try buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, .{});
+    defer alloc.free(chat_body);
+    var chat_parsed = try std.json.parseFromSlice(std.json.Value, alloc, chat_body, .{});
+    defer chat_parsed.deinit();
+    const chat_parts = chat_parsed.value.object
+        .get("messages").?.array.items[0].object
+        .get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), chat_parts.len);
+    try testing.expectEqualStrings("text", chat_parts[0].object.get("type").?.string);
+    try testing.expectEqualStrings("look", chat_parts[0].object.get("text").?.string);
+    try testing.expectEqualStrings("image_url", chat_parts[1].object.get("type").?.string);
+    try testing.expectEqualStrings(
+        expected_url,
+        chat_parts[1].object.get("image_url").?.object.get("url").?.string,
+    );
+}
+
+test "verified snapshots attach to the final user message on both wires" {
+    const alloc = testing.allocator;
+    var bytes = png_fixture_bytes.*;
+    const snapshots = [_]image_attachments.VerifiedSnapshot{.{
+        .bytes = &bytes,
+        .media_type = "image/png",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .system, .content = "rules" },
+        .{ .role = .user, .content = "inspect" },
+    };
+    const expected_url = "data:image/png;base64," ++ png_fixture_base64;
+    const options = BuildOptions{ .verified_images = &snapshots };
+
+    const responses_body = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, options);
+    defer alloc.free(responses_body);
+    var responses_parsed = try std.json.parseFromSlice(std.json.Value, alloc, responses_body, .{});
+    defer responses_parsed.deinit();
+    const responses_input = responses_parsed.value.object.get("input").?.array.items;
+    try testing.expectEqual(@as(usize, 1), responses_input.len);
+    const responses_parts = responses_input[0].object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), responses_parts.len);
+    try testing.expectEqualStrings("inspect", responses_parts[0].object.get("text").?.string);
+    try testing.expectEqualStrings(expected_url, responses_parts[1].object.get("image_url").?.string);
+
+    const chat_body = try buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, options);
+    defer alloc.free(chat_body);
+    var chat_parsed = try std.json.parseFromSlice(std.json.Value, alloc, chat_body, .{});
+    defer chat_parsed.deinit();
+    const chat_parts = chat_parsed.value.object
+        .get("messages").?.array.items[1].object
+        .get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), chat_parts.len);
+    try testing.expectEqualStrings(
+        expected_url,
+        chat_parts[1].object.get("image_url").?.object.get("url").?.string,
+    );
+}
+
+test "verified snapshots require a final user message without inline images" {
+    const alloc = testing.allocator;
+    var bytes = png_fixture_bytes.*;
+    const snapshots = [_]image_attachments.VerifiedSnapshot{.{
+        .bytes = &bytes,
+        .media_type = "image/png",
+    }};
+    const options = BuildOptions{ .verified_images = &snapshots };
+
+    const trailing_assistant = [_]types.ChatMessage{
+        .{ .role = .user, .content = "inspect" },
+        .{ .role = .assistant, .content = "sure" },
+    };
     try testing.expectError(
-        error.UnsupportedImageAttachments,
-        buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, .{}, .auto, null),
+        error.InvalidRequestHistory,
+        buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &trailing_assistant, options),
     );
     try testing.expectError(
-        error.UnsupportedImageAttachments,
-        buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, .{}, .auto, null),
+        error.InvalidRequestHistory,
+        buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &trailing_assistant, options),
+    );
+    try testing.expectError(
+        error.InvalidRequestHistory,
+        buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &.{}, options),
+    );
+}
+
+test "structured output reaches the matching field on each wire" {
+    const alloc = testing.allocator;
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "inspect" }};
+    const options = BuildOptions{
+        .response_format = .{
+            .name = "fx_vision_evidence",
+            .description = "Evidence \"only\"",
+            .schema_json = "{\"type\":\"object\",\"additionalProperties\":false}",
+        },
+    };
+
+    const responses_body = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, options);
+    defer alloc.free(responses_body);
+    var responses_parsed = try std.json.parseFromSlice(std.json.Value, alloc, responses_body, .{});
+    defer responses_parsed.deinit();
+    const format = responses_parsed.value.object.get("text").?.object.get("format").?.object;
+    try testing.expectEqualStrings("json_schema", format.get("type").?.string);
+    try testing.expectEqualStrings("fx_vision_evidence", format.get("name").?.string);
+    try testing.expectEqualStrings("Evidence \"only\"", format.get("description").?.string);
+    try testing.expect(!format.get("strict").?.bool);
+    try testing.expectEqualStrings("object", format.get("schema").?.object.get("type").?.string);
+    try testing.expect(!format.get("schema").?.object.get("additionalProperties").?.bool);
+
+    const chat_body = try buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, options);
+    defer alloc.free(chat_body);
+    var chat_parsed = try std.json.parseFromSlice(std.json.Value, alloc, chat_body, .{});
+    defer chat_parsed.deinit();
+    const response_format = chat_parsed.value.object.get("response_format").?.object;
+    try testing.expectEqualStrings("json_schema", response_format.get("type").?.string);
+    const json_schema = response_format.get("json_schema").?.object;
+    try testing.expectEqualStrings("fx_vision_evidence", json_schema.get("name").?.string);
+    try testing.expectEqualStrings("Evidence \"only\"", json_schema.get("description").?.string);
+    try testing.expect(!json_schema.get("strict").?.bool);
+    try testing.expectEqualStrings("object", json_schema.get("schema").?.object.get("type").?.string);
+
+    const invalid = BuildOptions{
+        .response_format = .{ .name = "bad", .schema_json = "not json" },
+    };
+    try testing.expectError(
+        error.InvalidStructuredResponseSchema,
+        buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, invalid),
+    );
+    try testing.expectError(
+        error.InvalidStructuredResponseSchema,
+        buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, invalid),
+    );
+
+    const plain = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, .{});
+    defer alloc.free(plain);
+    var plain_parsed = try std.json.parseFromSlice(std.json.Value, alloc, plain, .{});
+    defer plain_parsed.deinit();
+    try testing.expect(plain_parsed.value.object.get("text") == null);
+}
+
+test "a required tool name overrides the tool choice on both wires" {
+    const alloc = testing.allocator;
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "look" }};
+    const options = BuildOptions{ .tool_choice = .none, .required_tool_name = "vision" };
+
+    const responses_body = try buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, options);
+    defer alloc.free(responses_body);
+    var responses_parsed = try std.json.parseFromSlice(std.json.Value, alloc, responses_body, .{});
+    defer responses_parsed.deinit();
+    const responses_choice = responses_parsed.value.object.get("tool_choice").?.object;
+    try testing.expectEqualStrings("function", responses_choice.get("type").?.string);
+    try testing.expectEqualStrings("vision", responses_choice.get("name").?.string);
+
+    const chat_body = try buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, options);
+    defer alloc.free(chat_body);
+    var chat_parsed = try std.json.parseFromSlice(std.json.Value, alloc, chat_body, .{});
+    defer chat_parsed.deinit();
+    const chat_choice = chat_parsed.value.object.get("tool_choice").?.object;
+    try testing.expectEqualStrings("function", chat_choice.get("type").?.string);
+    try testing.expectEqualStrings(
+        "vision",
+        chat_choice.get("function").?.object.get("name").?.string,
+    );
+
+    const empty = BuildOptions{ .required_tool_name = "" };
+    try testing.expectError(
+        error.InvalidRequiredToolName,
+        buildResponsesRequestBody(alloc, "gpt-5.2", "[]", &messages, empty),
+    );
+    try testing.expectError(
+        error.InvalidRequiredToolName,
+        buildChatCompletionsRequestBody(alloc, "grok-4", "[]", &messages, empty),
     );
 }
 

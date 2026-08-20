@@ -320,7 +320,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
-    "/setup opens the four-action setup hub without source rows",
+    "/setup opens the setup hub without source rows",
     async () => {
       const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-direct-setup-")));
       session = await TmuxSession.create({
@@ -340,6 +340,9 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
         (pane) =>
           pane.includes("Setup") &&
           pane.includes("Sign in with Vercel") &&
+          // omfx: direct provider sign-in options.
+          pane.includes("Sign in with OpenAI (ChatGPT)") &&
+          pane.includes("Sign in with Grok (xAI)") &&
           pane.includes("API key") &&
           pane.includes("Change team") &&
           pane.includes("Switch credential"),

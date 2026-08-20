@@ -23,7 +23,9 @@
     },
     "env_unset": [
       "AI_GATEWAY_API_KEY",
-      "VERCEL_OIDC_TOKEN"
+      "VERCEL_OIDC_TOKEN",
+      "OPENAI_API_KEY",
+      "XAI_API_KEY"
     ],
     "timeout_seconds": 1800,
     "requires_tmux": true

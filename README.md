@@ -40,7 +40,7 @@ fx setup
 
 omfx can talk to model providers directly, without the Vercel AI Gateway. The gateway stays the default; a model routes to its provider when you give omfx a credential for that provider.
 
-Sign in with a subscription:
+Sign in with a subscription, either from the first-run "Get started" screen, from `/setup`, or from the CLI:
 
 ```bash
 fx login openai   # ChatGPT Plus/Pro/Team subscription (browser sign-in)
@@ -59,7 +59,9 @@ FX_MODEL=xai/grok-4 fx ask "explain this repository"
 Model ids keep the `provider/model` form; omfx strips the prefix on the wire. Routing rules:
 
 * A model routes directly only when its provider has a credential. An API-key environment variable wins over a saved OAuth session.
-* Every other model, and every turn that needs gateway-only features (image analysis, structured output), uses the normal gateway path and its credentials.
+* Every other model uses the normal gateway path and its credentials.
+* Direct routes carry the full feature set: tool calls, image input, structured output, and reasoning effort.
+* The model picker and `fx models` list the models your direct credentials can reach, merged with the gateway catalog. `fx status` shows the active direct credentials.
 * `fx logout openai` or `fx logout grok` removes a saved provider session. Sessions live in `~/.fx/auth-<provider>.json` and refresh automatically.
 
 The OpenAI subscription path uses the Codex backend and works with the models your ChatGPT plan includes. The Grok path calls `api.x.ai`; xAI may restrict OAuth API access by plan tier, in which case use `XAI_API_KEY`.

@@ -55,7 +55,8 @@ fn teamQueryProjection(query: []const u8, width: u16) TeamQueryProjection {
 pub fn authPickerRowCount(view: auth_runtime.PickerView) u16 {
     if (view.stage == .sign_in) return 7;
     if (view.stage == .api_key) return 4;
-    if (view.stage == .root and view.include_skip) return 17;
+    // omfx: two extra rows for the direct provider sign-in options.
+    if (view.stage == .root and view.include_skip) return 19;
     return @intCast(1 + @max(view.choiceCount(), 1));
 }
 
@@ -155,22 +156,34 @@ const onboarding_note = "   ⚠︎ Note: fx is experimental and defaults to auto
 const onboarding_note_link = onboarding_note ++ " \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\";
 
 fn onboardingProjectedRowIndex(view: auth_runtime.PickerView, row_index: u16, row_count: u16) u16 {
-    if (row_count >= 17) return row_index;
+    // omfx: the template holds four sign-in choices on rows 8..11.
+    if (row_count >= 19) return row_index;
 
-    const selected_row: u16 = if (view.selectedIndex() == 0) 8 else 9;
-    const other_row: u16 = if (selected_row == 8) 9 else 8;
-    const priority = [_]u16{ selected_row, other_row, 14, 7, 11, 5, 0, 2, 3, 6, 10, 12, 13, 1, 4, 15, 16 };
+    const selected_row: u16 = @intCast(8 + @as(usize, @min(view.selectedIndex(), 3)));
+    var priority: [19]u16 = undefined;
+    var priority_len: usize = 0;
+    priority[priority_len] = selected_row;
+    priority_len += 1;
+    for ([_]u16{ 8, 9, 10, 11 }) |choice_row| {
+        if (choice_row == selected_row) continue;
+        priority[priority_len] = choice_row;
+        priority_len += 1;
+    }
+    for ([_]u16{ 16, 7, 13, 5, 0, 2, 3, 6, 12, 14, 15, 1, 4, 17, 18 }) |static_row| {
+        priority[priority_len] = static_row;
+        priority_len += 1;
+    }
 
     var projected_index: u16 = 0;
-    for (0..17) |source_row| {
-        for (priority[0..@min(row_count, priority.len)]) |included_row| {
+    for (0..19) |source_row| {
+        for (priority[0..@min(row_count, priority_len)]) |included_row| {
             if (source_row != included_row) continue;
             if (projected_index == row_index) return @intCast(source_row);
             projected_index += 1;
             break;
         }
     }
-    return 16;
+    return 18;
 }
 
 fn composeOnboardingPickerRow(
@@ -185,9 +198,12 @@ fn composeOnboardingPickerRow(
     if (width == 0) return row;
 
     const source_row_index = onboardingProjectedRowIndex(view, row_index, row_count);
+    // omfx: four sign-in choices.
     const maybe_choice_index: ?usize = switch (source_row_index) {
         8 => 0,
         9 => 1,
+        10 => 2,
+        11 => 3,
         else => null,
     };
     if (maybe_choice_index) |choice_index| {
@@ -215,12 +231,13 @@ fn composeOnboardingPickerRow(
         5 => "   You can change this anytime with /setup.",
         6 => "",
         7 => "   Get started",
-        10 => "",
-        11 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
+        // omfx: rows 8..11 are choices; static copy moves down two rows.
         12 => "",
-        13 => "",
-        14 => "   Esc to set up later · Explore all commands with /help",
-        15, 16 => "",
+        13 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
+        14 => "",
+        15 => "",
+        16 => "   Esc to set up later · Explore all commands with /help",
+        17, 18 => "",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
@@ -338,7 +355,9 @@ pub fn activeListPickerReservedRows(terminal_rows: u16, input_extra: u16, banner
 }
 
 pub fn authPickerReservedRows(view: auth_runtime.PickerView, terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
-    if (view.stage == .sign_in or (view.stage == .root and view.include_skip)) {
+    // omfx: the root hub lists more sign-in options than the shared picker
+    // cap allows, so size it to its own content and let the terminal bound it.
+    if (view.stage == .sign_in or view.stage == .root) {
         const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);
         return @min(authPickerRowCount(view), @max(available_rows, 1));
     }
@@ -1541,7 +1560,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
         .include_skip = true,
     };
 
-    try std.testing.expectEqual(@as(u16, 17), authPickerRowCount(view));
+    try std.testing.expectEqual(@as(u16, 19), authPickerRowCount(view));
     var screen: std.ArrayList(u8) = .empty;
     defer screen.deinit(alloc);
     for (0..authPickerRowCount(view)) |row_index| {
@@ -1557,6 +1576,9 @@ test "auth onboarding composes the welcome copy and setup choices" {
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
+    // omfx: direct provider options appear in the onboarding list.
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with OpenAI (ChatGPT)") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Grok (xAI)") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Add an API key") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Esc to set up later · Explore all commands with /help") != null);
 
@@ -1572,23 +1594,31 @@ test "auth onboarding composes the welcome copy and setup choices" {
     defer selected_row.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, selected_row.items, "› Sign in with Vercel") != null);
 
+    // omfx: rows 9..11 hold the provider options and the API key entry.
     var unselected_row = try composeAuthPickerRow(alloc, view, 9, authPickerRowCount(view), 100);
     defer unselected_row.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, unselected_row.items, "Add an API key") != null);
+    try std.testing.expect(std.mem.find(u8, unselected_row.items, "Sign in with OpenAI (ChatGPT)") != null);
 
-    var narrow_note = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 58);
+    var api_key_row = try composeAuthPickerRow(alloc, view, 11, authPickerRowCount(view), 100);
+    defer api_key_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, api_key_row.items, "Add an API key") != null);
+
+    var narrow_note = try composeAuthPickerRow(alloc, view, 13, authPickerRowCount(view), 58);
     defer narrow_note.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_note.items, "https://fx.sh/docs/stability") == null);
 
+    // omfx: five compressed rows keep all four options plus the esc hint.
     var compact_screen: std.ArrayList(u8) = .empty;
     defer compact_screen.deinit(alloc);
-    for (0..3) |row_index| {
-        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), 3, 100);
+    for (0..5) |row_index| {
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), 5, 100);
         defer row.deinit(alloc);
         try compact_screen.appendSlice(alloc, row.items);
         try compact_screen.append(alloc, '\n');
     }
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with OpenAI (ChatGPT)") != null);
+    try std.testing.expect(std.mem.find(u8, compact_screen.items, "Sign in with Grok (xAI)") != null);
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Add an API key") != null);
     try std.testing.expect(std.mem.find(u8, compact_screen.items, "Esc to set up later") != null);
 }
@@ -1603,7 +1633,8 @@ test "auth picker composes only detected credential sources" {
         .include_skip = false,
     };
     const row_count = authPickerRowCount(view);
-    try std.testing.expectEqual(@as(u16, 5), row_count);
+    // omfx: the setup hub gains the two direct provider options.
+    try std.testing.expectEqual(@as(u16, 7), row_count);
 
     var header = try composeAuthPickerRow(alloc, view, 0, row_count, 80);
     defer header.deinit(alloc);
@@ -1613,16 +1644,24 @@ test "auth picker composes only detected credential sources" {
     defer sign_in.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, sign_in.items, "Sign in with Vercel") != null);
 
-    var setup = try composeAuthPickerRow(alloc, view, 2, row_count, 80);
+    var openai_row = try composeAuthPickerRow(alloc, view, 2, row_count, 80);
+    defer openai_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, openai_row.items, "Sign in with OpenAI (ChatGPT)") != null);
+
+    var grok_row = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    defer grok_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, grok_row.items, "Sign in with Grok (xAI)") != null);
+
+    var setup = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
     defer setup.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, setup.items, "API key") != null);
 
-    var change_team = try composeAuthPickerRow(alloc, view, 3, row_count, 80);
+    var change_team = try composeAuthPickerRow(alloc, view, 5, row_count, 80);
     defer change_team.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, change_team.items, "Change team") != null);
     try std.testing.expect(std.mem.find(u8, change_team.items, "sign in first") != null);
 
-    var switch_credential = try composeAuthPickerRow(alloc, view, 4, row_count, 80);
+    var switch_credential = try composeAuthPickerRow(alloc, view, 6, row_count, 80);
     defer switch_credential.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, switch_credential.items, "Switch credential") != null);
 }

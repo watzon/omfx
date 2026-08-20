@@ -14,6 +14,8 @@ const openai_stream = @import("../../gateway/openai_stream_provider.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const gateway_schema = @import("../tooling/gateway_schema.zig");
+const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const provider_credentials = @import("provider_credentials.zig");
 const registry = @import("registry.zig");
 
@@ -21,16 +23,13 @@ const Allocator = std.mem.Allocator;
 
 const direct_payload_prefix = "{\"model\":";
 
-/// True when a build request can be served on a direct wire protocol.
-/// Vision-required turns, structured output, and dynamic tool schemas stay
-/// on the gateway. Optional vision routes directly without the vision tool;
-/// turns that embed image attachments fall back through the codec's
-/// UnsupportedImageAttachments rejection.
-fn buildEligible(request: agent_stream_provider.BuildRequest) bool {
-    return request.vision_mode != .required and
-        request.verified_images == null and
-        request.response_format == null and
-        request.selected_dynamic_tool_schemas.len == 0;
+/// Mirrors the constraints buildAgentRequest enforces before building.
+fn validateBuildShape(request: agent_stream_provider.BuildRequest) !void {
+    if (request.verified_images != null) {
+        if (request.response_format == null) return error.MissingStructuredResponseFormat;
+        return;
+    }
+    if (request.response_format != null) return error.StructuredResponseRequiresVerifiedImages;
 }
 
 fn routeForModel(model: []const u8) ?struct {
@@ -42,41 +41,107 @@ fn routeForModel(model: []const u8) ?struct {
     return .{ .def = def, .kind = kind };
 }
 
+fn writeVisionSchema(alloc: Allocator, tool_registry: tool_dispatch.Registry) ![]u8 {
+    const vision_tool = tool_registry.lookup("vision") orelse return error.VisionToolNotRegistered;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try gateway_schema.writeBuiltinFunctionSchema(alloc, &out.writer, vision_tool.gateway_schema);
+    return out.toOwnedSlice();
+}
+
+/// Appends extra tool schema objects to a serialized tools JSON array.
+fn mergeToolsJson(alloc: Allocator, serialized_tools: []const u8, extras: []const []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, serialized_tools, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '[' or trimmed[trimmed.len - 1] != ']') {
+        return error.InvalidToolSchema;
+    }
+    const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeByte('[');
+    try out.writer.writeAll(inner);
+    for (extras) |extra| {
+        if (out.writer.buffered().len > 1) try out.writer.writeByte(',');
+        try out.writer.writeAll(extra);
+    }
+    try out.writer.writeByte(']');
+    return out.toOwnedSlice();
+}
+
 fn buildDirect(
     alloc: Allocator,
     def: *const registry.Def,
     kind: provider_credentials.Kind,
     request: agent_stream_provider.BuildRequest,
-) anyerror!?[]u8 {
+) anyerror![]u8 {
+    if (request.budget) |budget| {
+        if (budget.cancel_flag) |flag| {
+            if (flag.load(.seq_cst)) return error.Cancelled;
+        }
+    }
+    try validateBuildShape(request);
+
     const wire = switch (kind) {
         .api_key => def.api_wire,
         .oauth => def.oauth_wire,
     };
     const bare_model = registry.bareModel(def, request.model);
-    const body = switch (wire) {
+
+    var options: openai_json.BuildOptions = .{
+        .provider_options = request.provider_options,
+        .tool_choice = request.tool_choice,
+        .max_output_tokens = request.max_output_tokens,
+        .verified_images = request.verified_images,
+    };
+    if (request.response_format) |format| {
+        options.response_format = .{
+            .name = format.name,
+            .description = format.description,
+            .schema_json = format.schema_json,
+        };
+    }
+
+    const vision_schema: ?[]u8 = if (request.vision_mode != .unavailable)
+        try writeVisionSchema(alloc, request.tool_registry)
+    else
+        null;
+    defer if (vision_schema) |schema| alloc.free(schema);
+
+    var owned_tools: ?[]u8 = null;
+    defer if (owned_tools) |tools| alloc.free(tools);
+    var tools_json: []const u8 = request.serialized_tools;
+
+    if (request.vision_mode == .required) {
+        owned_tools = try std.fmt.allocPrint(alloc, "[{s}]", .{vision_schema.?});
+        tools_json = owned_tools.?;
+        options.required_tool_name = "vision";
+    } else {
+        var extras: std.ArrayList([]const u8) = .empty;
+        defer extras.deinit(alloc);
+        for (request.selected_dynamic_tool_schemas) |schema| try extras.append(alloc, schema);
+        if (vision_schema) |schema| try extras.append(alloc, schema);
+        if (extras.items.len > 0) {
+            owned_tools = try mergeToolsJson(alloc, request.serialized_tools, extras.items);
+            tools_json = owned_tools.?;
+        }
+    }
+
+    return switch (wire) {
         .openai_responses => openai_json.buildResponsesRequestBody(
             alloc,
             bare_model,
-            request.serialized_tools,
+            tools_json,
             request.messages,
-            request.provider_options,
-            request.tool_choice,
-            request.max_output_tokens,
+            options,
         ),
         .openai_chat_completions => openai_json.buildChatCompletionsRequestBody(
             alloc,
             bare_model,
-            request.serialized_tools,
+            tools_json,
             request.messages,
-            request.provider_options,
-            request.tool_choice,
-            request.max_output_tokens,
+            options,
         ),
-    } catch |err| switch (err) {
-        error.UnsupportedImageAttachments => return null,
-        else => return err,
     };
-    return body;
 }
 
 fn streamDirect(
@@ -120,12 +185,8 @@ pub fn makeBuild(comptime fallback: agent_stream_provider.BuildFn) agent_stream_
             alloc: Allocator,
             request: agent_stream_provider.BuildRequest,
         ) anyerror![]u8 {
-            if (buildEligible(request)) {
-                if (routeForModel(request.model)) |route| {
-                    if (try buildDirect(alloc, route.def, route.kind, request)) |body| {
-                        return body;
-                    }
-                }
+            if (routeForModel(request.model)) |route| {
+                return buildDirect(alloc, route.def, route.kind, request);
             }
             return fallback(context, alloc, request);
         }
@@ -170,7 +231,7 @@ test "gateway payloads never route to a direct provider" {
     ));
 }
 
-test "build eligibility excludes vision and structured output requests" {
+test "build shape validation mirrors the gateway builder rules" {
     const base = agent_stream_provider.BuildRequest{
         .model = "openai/gpt-5.2",
         .serialized_tools = "[]",
@@ -178,19 +239,34 @@ test "build eligibility excludes vision and structured output requests" {
         .tool_choice = .auto,
         .provider_options = .{},
     };
-    try std.testing.expect(buildEligible(base));
-
-    var vision = base;
-    vision.vision_mode = .optional;
-    try std.testing.expect(!buildEligible(vision));
+    try validateBuildShape(base);
 
     var structured = base;
     structured.response_format = .{ .name = "n", .description = "d", .schema_json = "{}" };
-    try std.testing.expect(!buildEligible(structured));
+    try std.testing.expectError(
+        error.StructuredResponseRequiresVerifiedImages,
+        validateBuildShape(structured),
+    );
 
-    var dynamic = base;
-    dynamic.selected_dynamic_tool_schemas = &.{"{}"};
-    try std.testing.expect(!buildEligible(dynamic));
+    var images_only = base;
+    images_only.verified_images = &.{};
+    try std.testing.expectError(
+        error.MissingStructuredResponseFormat,
+        validateBuildShape(images_only),
+    );
+}
+
+test "merging tool schemas keeps existing entries and appends extras" {
+    const alloc = std.testing.allocator;
+    const merged = try mergeToolsJson(alloc, "[{\"name\":\"a\"}]", &.{ "{\"name\":\"b\"}", "{\"name\":\"c\"}" });
+    defer alloc.free(merged);
+    try std.testing.expectEqualStrings("[{\"name\":\"a\"},{\"name\":\"b\"},{\"name\":\"c\"}]", merged);
+
+    const from_empty = try mergeToolsJson(alloc, "[]", &.{"{\"name\":\"b\"}"});
+    defer alloc.free(from_empty);
+    try std.testing.expectEqualStrings("[{\"name\":\"b\"}]", from_empty);
+
+    try std.testing.expectError(error.InvalidToolSchema, mergeToolsJson(alloc, "{}", &.{"{}"}));
 }
 
 test "models without provider credentials fall through" {

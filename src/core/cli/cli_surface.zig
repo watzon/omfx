@@ -23,6 +23,7 @@ const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
 // omfx: direct provider sign-in (openai, xai/grok).
 const omfx_oauth_flows = @import("../providers/oauth_flows.zig");
+const omfx_provider_credentials = @import("../providers/provider_credentials.zig");
 const omfx_registry = @import("../providers/registry.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
@@ -841,11 +842,15 @@ fn runNonInteractiveWithDeps(
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
             const mcp_config_diagnostic = try cfg.inspect_mcp_profile_config(alloc);
 
-            const snapshot = statusSnapshotFromStartupWithBuild(startup, .{
+            var snapshot = statusSnapshotFromStartupWithBuild(startup, .{
                 .channel = cfg.build_channel,
                 .version = cfg.version,
                 .revision = cfg.revision,
             }, mcp_config_diagnostic);
+            // omfx: surface direct provider credentials in fx status.
+            const direct_providers = try omfx_provider_credentials.statusSummaryAlloc(alloc);
+            defer if (direct_providers) |value| alloc.free(value);
+            snapshot.direct_providers = direct_providers;
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;

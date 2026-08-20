@@ -29,12 +29,16 @@ function sse(events: unknown[]): string {
 
 function startFakeProvider(
   respond: (request: CapturedRequest, index: number) => unknown[],
+  models: string[] = [],
 ): FakeProvider {
   const requests: CapturedRequest[] = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
+      if (req.method === "GET") {
+        return Response.json({ data: models.map((id) => ({ id })) });
+      }
       const captured: CapturedRequest = {
         path: new URL(req.url).pathname,
         authorization: req.headers.get("authorization") ?? "",
@@ -261,6 +265,91 @@ test(
     expect(result.code).toBe(1);
     const output = JSON.parse(result.stdout);
     expect(output.error).toBe("MissingCredentials");
+  },
+  TIMEOUT,
+);
+
+test(
+  "image attachments encode as input_image parts on the responses wire",
+  async () => {
+    const provider = startFakeProvider(() => [
+      { type: "response.created", response: { id: "resp-img" } },
+      { type: "response.output_text.delta", delta: "a tiny square" },
+      {
+        type: "response.completed",
+        response: { id: "resp-img", usage: { input_tokens: 9, output_tokens: 3 } },
+      },
+    ]);
+    cleanups.push(provider.stop);
+
+    const workspace = mkdtempSync(join(tmpdir(), "fx-e2e-direct-image-"));
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+      "base64",
+    );
+    writeFileSync(join(workspace, "pixel.png"), png);
+
+    const result = await runFx(
+      ["ask", "--no-save", "--json", "--image", "pixel.png", "describe this"],
+      {
+        cwd: workspace,
+        env: {
+          ...baseEnv,
+          HOME: tempHome(),
+          OPENAI_API_KEY: "test-openai-key",
+          OMFX_OPENAI_BASE_URL: provider.url,
+          FX_MODEL: "openai/gpt-5.2",
+        },
+      },
+    );
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toBe("a tiny square");
+    expect(provider.requests).toHaveLength(1);
+    const input = provider.requests[0]!.body.input;
+    const parts = input
+      .filter((item: any) => item.type === "message")
+      .flatMap((item: any) => item.content ?? []);
+    const image = parts.find((part: any) => part.type === "input_image");
+    expect(image.image_url).toStartWith("data:image/png;base64,");
+  },
+  TIMEOUT,
+);
+
+test(
+  "fx models merges direct provider models into the catalog",
+  async () => {
+    const provider = startFakeProvider(() => [], ["grok-e2e-test-model"]);
+    cleanups.push(provider.stop);
+
+    const result = await runFx(["models"], {
+      env: {
+        ...baseEnv,
+        HOME: tempHome(),
+        XAI_API_KEY: "test-xai-key",
+        OMFX_XAI_BASE_URL: provider.url,
+      },
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("xai/grok-e2e-test-model");
+  },
+  TIMEOUT,
+);
+
+test(
+  "fx status reports direct provider credentials",
+  async () => {
+    const result = await runFx(["status", "--json"], {
+      env: {
+        ...baseEnv,
+        HOME: tempHome(),
+        XAI_API_KEY: "test-xai-key",
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).direct_providers).toBe("xai (api key)");
   },
   TIMEOUT,
 );

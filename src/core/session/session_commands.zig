@@ -8,6 +8,8 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+// omfx: direct provider credentials shown in /status.
+const omfx_provider_credentials = @import("../providers/provider_credentials.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
 const sandbox = @import("../permissions/sandbox.zig");
@@ -266,7 +268,11 @@ pub fn Commands(comptime App: type) type {
 
         pub fn showStatus(app: *App) !void {
             const auth = app.auth.statusSnapshot();
+            // omfx: surface direct provider credentials in /status.
+            const direct_providers = try omfx_provider_credentials.statusSummaryAlloc(app.alloc);
+            defer if (direct_providers) |value| app.alloc.free(value);
             const text = try (output_contracts.StatusSnapshot{
+                .direct_providers = direct_providers,
                 .model = app.selected_model.items,
                 .update_channel = update_channel_label(app),
                 .build_channel = if (@hasDecl(App, "build_update_channel")) App.build_update_channel.label() else "stable",

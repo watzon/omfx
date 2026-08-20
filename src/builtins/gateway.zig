@@ -1998,8 +1998,27 @@ pub fn fetchPickerModelCatalogCancellable(
     return fetchModelCatalogForView(alloc, access, path, cancel_flag, .picker);
 }
 
+// omfx: append models from credentialed direct providers to every catalog
+// consumer (picker, fx models, capability resolution).
+const omfx_catalog_merge = @import("../core/providers/catalog_merge.zig");
+const omfx_direct_model_catalog = @import("../core/providers/direct_model_catalog.zig");
+
+fn omfxFetchCatalogWithDirectProviders(
+    context: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    input: model_catalog.FetchInput,
+) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    const gateway_result = try fetchCatalogForProvider(context, alloc, input);
+    return omfx_catalog_merge.mergeDirectProviders(
+        alloc,
+        omfx_direct_model_catalog.default_transport,
+        oauth_transport_provider,
+        gateway_result,
+    );
+}
+
 pub const model_catalog_provider = model_catalog.Provider{
-    .fetch_fn = fetchCatalogForProvider,
+    .fetch_fn = omfxFetchCatalogWithDirectProviders,
 };
 
 pub const ModelCatalogEntry = model_catalog.ModelCatalogEntry;

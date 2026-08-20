@@ -58,6 +58,28 @@ pub fn modelHasDirectCredential(model: []const u8) bool {
     return exists(def);
 }
 
+/// Status summary such as "openai (subscription), xai (api key)", or null
+/// when no direct provider has a credential. The caller owns the result.
+pub fn statusSummaryAlloc(alloc: Allocator) !?[]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var any = false;
+    for (&registry.defs) |*def| {
+        const kind = preferredKind(def) orelse continue;
+        if (any) try out.writer.writeAll(", ");
+        try out.writer.print("{s} ({s})", .{ def.key, switch (kind) {
+            .api_key => "api key",
+            .oauth => "subscription",
+        } });
+        any = true;
+    }
+    if (!any) {
+        out.deinit();
+        return null;
+    }
+    return try out.toOwnedSlice();
+}
+
 /// Resolves the live credential, refreshing an expiring OAuth session.
 /// The caller owns the returned credential.
 pub fn resolve(

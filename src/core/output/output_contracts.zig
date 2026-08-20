@@ -367,6 +367,8 @@ pub const StatusSnapshot = struct {
     build_revision: []const u8 = "",
     auth: auth_runtime.StatusSnapshot = .{},
     auth_help: ?[]const u8 = null,
+    // omfx: comma-joined direct provider credentials, e.g. "openai (subscription)".
+    direct_providers: ?[]const u8 = null,
     mcp_config_error: ?[]const u8 = null,
     permission_mode: types.PermissionMode,
     sandbox_backend: sandbox.BackendKind = .none,
@@ -404,6 +406,10 @@ pub const StatusSnapshot = struct {
         if (self.auth.team) |team| {
             try out.writer.print("[status] team={s}\n", .{team});
         }
+        // omfx: direct provider credentials.
+        if (self.direct_providers) |providers| {
+            try out.writer.print("[status] direct_providers={s}\n", .{providers});
+        }
         try out.writer.print("[status] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
         try out.writer.print("[status] sandbox={s}\n", .{sandbox.publicModeForBackend(self.sandbox_backend).label()});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
@@ -428,6 +434,8 @@ pub const StatusSnapshot = struct {
         if (self.auth.expired) try out.writer.writeAll("auth_expired=true\n");
         if (self.auth_help) |help| try out.writer.print("auth_help={s}\n", .{help});
         if (self.auth.team) |team| try out.writer.print("team={s}\n", .{team});
+        // omfx: direct provider credentials.
+        if (self.direct_providers) |providers| try out.writer.print("direct_providers={s}\n", .{providers});
         try out.writer.print("permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
         try out.writer.print("sandbox={s}\n", .{sandbox.publicModeForBackend(self.sandbox_backend).label()});
         try out.writer.print("workspace={s}\n", .{self.workspace_root});
@@ -469,6 +477,11 @@ pub const StatusSnapshot = struct {
         if (self.auth.team) |team| {
             try writer.writeAll(",\"team\":");
             try std.json.Stringify.value(team, .{}, writer);
+        }
+        // omfx: direct provider credentials.
+        if (self.direct_providers) |providers| {
+            try writer.writeAll(",\"direct_providers\":");
+            try std.json.Stringify.value(providers, .{}, writer);
         }
         try writer.writeAll(",\"permission_mode\":");
         try std.json.Stringify.value(permissionModeLabel(self.permission_mode), .{}, writer);
