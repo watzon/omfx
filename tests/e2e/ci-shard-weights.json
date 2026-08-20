@@ -7,6 +7,7 @@
   { "file": "cli.test.ts", "weight": 19 },
   { "file": "config-persistence.test.ts", "weight": 64 },
   { "file": "context-limits-live.test.ts", "weight": 1 },
+  { "file": "direct-providers.test.ts", "weight": 1 },
   { "file": "file-tool-paths.test.ts", "weight": 6 },
   { "file": "file-tool-permissions.test.ts", "weight": 2 },
   { "file": "gateway-stream-lifecycle.test.ts", "weight": 98 },

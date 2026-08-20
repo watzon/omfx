@@ -35,8 +35,11 @@ These files exist only in omfx. Upstream merges never touch them:
 
 * `src/omfx.zig`: fork identity constants and the `upstream_upgrades_enabled` flag.
 * `UPSTREAM.md`: this document.
+* `src/core/providers/`: direct provider registry, credentials, router, and OAuth flows.
+* `src/gateway/openai_json.zig`, `src/gateway/openai_stream_provider.zig`: OpenAI-compatible wire codecs and transport.
+* `tests/e2e/direct-providers.test.ts`: deterministic coverage for direct provider routing.
 
-Shared files with `// omfx:` hooks at the time of writing: `build.zig` (binary name and `fx` alias install), `src/main.zig` (version suffix), `src/core/upgrade/auto_upgrade.zig` (upgrade gate), `src/core/cli/cli_surface.zig` (upgrade gate), and a fork notice at the top of `AGENTS.md`. The grep command above is authoritative; this list is a snapshot.
+Shared files with `// omfx:` hooks at the time of writing: `build.zig` (binary name and `fx` alias install), `src/main.zig` (version suffix), `src/core/upgrade/auto_upgrade.zig` (upgrade gate), `src/core/cli/cli_surface.zig` (upgrade gate, provider login/logout), `src/builtins/gateway.zig` (provider router), `src/builtins/commands.zig` (login/logout usage text), `src/core/cli/cli_ask.zig` and `src/core/app/app_auth_runtime.zig` (direct credentials satisfy the credential gate), and a fork notice at the top of `AGENTS.md`. The grep command above is authoritative; this list is a snapshot.
 
 ## Sync procedure
 
