@@ -5,6 +5,8 @@ const host = @import("../hosts/host.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const io_mod = @import("../shared/io.zig");
 const credentials = @import("../auth/credentials.zig");
+// omfx: direct provider credentials can satisfy the prompt credential gate.
+const omfx_provider_credentials = @import("../providers/provider_credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const types = @import("../shared/types.zig");
@@ -513,6 +515,9 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return false;
             }
+            // omfx: models served by a direct provider credential admit the
+            // prompt without a gateway credential to check or refresh.
+            if (omfx_provider_credentials.modelHasDirectCredential(app.selected_model.items)) return true;
             if (!try ensurePromptCredential(app)) return false;
             return preparePromptCredential(app);
         }

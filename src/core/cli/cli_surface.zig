@@ -21,6 +21,9 @@ const github_publish = @import("../github/github_publish.zig");
 const github_workflows = @import("../github/github_workflows.zig");
 const host = @import("../hosts/host.zig");
 const login_flow = @import("../auth/login_flow.zig");
+// omfx: direct provider sign-in (openai, xai/grok).
+const omfx_oauth_flows = @import("../providers/oauth_flows.zig");
+const omfx_registry = @import("../providers/registry.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const secret = @import("../auth/secret.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -724,8 +727,25 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
+            // omfx: `fx login <provider>` signs in to a direct model
+            // provider (openai, xai/grok); bare `fx login` stays Vercel.
+            if (rest.len == 1) {
+                if (omfx_registry.byKey(std.mem.sliceTo(rest[0], 0))) |def| {
+                    omfx_oauth_flows.runLogin(alloc, cfg.gateway_provider.oauth_transport, def) catch |err| {
+                        const message = switch (err) {
+                            error.AuthorizationDenied => "fx login: authorization denied\n",
+                            error.DeviceCodeExpired, error.CallbackTimedOut => "fx login: authorization expired; try again\n",
+                            error.CallbackPortBusy => "fx login: localhost callback port is busy; close the other listener and try again\n",
+                            else => "fx login: failed to sign in\n",
+                        };
+                        try writeStderr(deps, message);
+                        return .handled_failure;
+                    };
+                    return .handled_success;
+                }
+            }
             if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx login\n");
+                try writeStderr(deps, "usage: fx login [openai|grok]\n");
                 return .handled_failure;
             }
             login_flow.runLogin(
@@ -745,8 +765,19 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .logout => |rest| {
+            // omfx: `fx logout <provider>` removes a direct provider session.
+            if (rest.len == 1) {
+                if (omfx_registry.byKey(std.mem.sliceTo(rest[0], 0))) |def| {
+                    const deleted = omfx_oauth_flows.logout(alloc, def) catch {
+                        try writeStderr(deps, "fx logout: failed to remove the saved provider login\n");
+                        return .handled_failure;
+                    };
+                    try writeStdout(deps, if (deleted) "Signed out.\n" else "No saved login for that provider.\n");
+                    return .handled_success;
+                }
+            }
             if (rest.len != 0) {
-                try writeStderr(deps, "usage: fx logout\n");
+                try writeStderr(deps, "usage: fx logout [openai|grok]\n");
                 return .handled_failure;
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {

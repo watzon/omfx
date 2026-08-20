@@ -7,6 +7,8 @@ pub const version = "0.0.4+omfx.1";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
+// omfx: direct provider credentials can satisfy prompt admission.
+const omfx_provider_credentials = @import("core/providers/provider_credentials.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
 const oauth_transport = @import("core/auth/oauth_transport.zig");
 const js_host_auth = @import("core/auth/js_host_auth.zig");
@@ -1250,7 +1252,12 @@ const App = struct {
         const model_copy = try std.heap.c_allocator.dupe(u8, self.selected_model.items);
         errdefer std.heap.c_allocator.free(model_copy);
 
-        const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        // omfx: direct-provider models queue without a gateway credential.
+        const gateway_credential = self.auth.gatewayCredential() orelse
+            if (omfx_provider_credentials.modelHasDirectCredential(self.selected_model.items))
+                auth_runtime.GatewayCredential{ .api_key = "", .gateway_team = null, .source = .ai_gateway_api_key }
+            else
+                return error.MissingApiKey;
         const api_key_copy = try std.heap.c_allocator.dupe(u8, gateway_credential.api_key);
         errdefer secret.zeroAndFree(std.heap.c_allocator, api_key_copy);
 
@@ -1330,7 +1337,9 @@ const App = struct {
             .model = model_copy,
             .api_key = api_key_copy,
             .gateway_team = gateway_team_copy,
-            .credential_source = gateway_credential.source,
+            // omfx: an empty api key marks a direct-provider turn without a
+            // gateway credential source.
+            .credential_source = if (gateway_credential.api_key.len == 0) null else gateway_credential.source,
             .permission_mode = self.permission_engine.mode,
             .sandbox_backend = sandbox.effectiveBackend(
                 self.permission_engine.mode,

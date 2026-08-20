@@ -123,9 +123,13 @@ pub const oauth_transport_provider = oauth_transport.Provider{
 
 pub const generation_usage_provider = gateway_generation_usage.provider;
 
+// omfx: route models with direct provider credentials (openai/, xai/)
+// around the gateway transport; all other models use the upstream path.
+const omfx_router = @import("../core/providers/router_stream_provider.zig");
+
 pub const agent_stream_provider = agent_stream_provider_contract.Provider{
-    .build_fn = buildAgentRequest,
-    .stream_fn = streamAgentCompletion,
+    .build_fn = omfx_router.makeBuild(buildAgentRequest),
+    .stream_fn = omfx_router.makeStream(streamAgentCompletion, oauth_transport_provider),
 };
 
 pub const provider = gateway_provider.Provider{

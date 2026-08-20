@@ -6,6 +6,8 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+// omfx: direct provider credentials can satisfy the credential gate.
+const omfx_provider_credentials = @import("../providers/provider_credentials.zig");
 const oauth_transport = @import("../auth/oauth_transport.zig");
 const background_runtime = @import("../background/background_runtime.zig");
 const terminal_client_runtime = @import("../terminal/client.zig");
@@ -1344,7 +1346,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     );
     try checkHeadlessCancellation(options.deps);
 
-    if (!options.continue_recovery and startup.credential == null) {
+    if (!options.continue_recovery and startup.credential == null and
+        // omfx: a direct provider credential for the selected model suffices.
+        !omfx_provider_credentials.modelHasDirectCredential(startup.selected_model))
+    {
         return missingCredentialResult(alloc, options);
     }
 
@@ -1425,13 +1430,17 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
     }
 
-    const credential = startup.credential orelse
+    // omfx: models served by a direct provider credential run without a
+    // gateway credential; the AskContext defaults already fit that case.
+    if (startup.credential) |credential| {
+        const api_key = credential.token;
+        ctx.api_key = api_key;
+        ctx.gateway_team = credential.gatewayTeam();
+        ctx.credential_source = credential.source;
+        ctx.model_catalog_access = credentials.catalogAccessForCredential(credential.source, api_key, credential.gatewayTeam());
+    } else if (!omfx_provider_credentials.modelHasDirectCredential(ctx.model)) {
         return missingCredentialResult(alloc, options);
-    const api_key = credential.token;
-    ctx.api_key = api_key;
-    ctx.gateway_team = credential.gatewayTeam();
-    ctx.credential_source = credential.source;
-    ctx.model_catalog_access = credentials.catalogAccessForCredential(credential.source, api_key, credential.gatewayTeam());
+    }
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
@@ -1552,9 +1561,11 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .images = current_images,
         .authorized_image_catalog = authorized_image_catalog,
         .model = @constCast(ctx.model),
-        .api_key = api_key,
-        .gateway_team = if (credential.gatewayTeam()) |team| @constCast(team) else null,
-        .credential_source = credential.source,
+        // omfx: read from the context so direct-provider runs without a
+        // gateway credential use the same defaults as the rest of the turn.
+        .api_key = @constCast(ctx.api_key),
+        .gateway_team = if (ctx.gateway_team) |team| @constCast(team) else null,
+        .credential_source = ctx.credential_source,
         .permission_mode = ctx.permission_mode,
         .sandbox_backend = ctx.sandbox_backend,
         .history = context_history,

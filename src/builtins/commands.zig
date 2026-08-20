@@ -89,14 +89,16 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login",
-        .summary = "Sign in with Vercel",
+        // omfx: optional provider argument for direct sign-in.
+        .usage = "login [openai|grok]",
+        .summary = "Sign in with Vercel, or with a model provider",
     },
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout",
-        .summary = "Sign out of the current Vercel session",
+        // omfx: optional provider argument for direct sign-out.
+        .usage = "logout [openai|grok]",
+        .summary = "Sign out of the current Vercel or provider session",
     },
     .{
         .kind = .setup,
@@ -285,14 +287,17 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .usage = "session recover <id>", .summary = "Copy a recoverable corrupt session" },
         .{ .kind = .replay, .usage = "replay <tape>" },
     } },
-    .{ .entries = &.{
-        .{ .kind = .login, .usage = "login" },
-        .{ .kind = .logout, .usage = "logout" },
-        .{ .kind = .setup, .usage = "setup" },
-        .{ .kind = .teams, .usage = "teams" },
-        .{ .kind = .credits, .usage = "credits|balance" },
-        .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]" },
-    } },
+    .{
+        .entries = &.{
+            // omfx: optional provider argument for direct sign-in.
+            .{ .kind = .login, .usage = "login [openai|grok]" },
+            .{ .kind = .logout, .usage = "logout [openai|grok]" },
+            .{ .kind = .setup, .usage = "setup" },
+            .{ .kind = .teams, .usage = "teams" },
+            .{ .kind = .credits, .usage = "credits|balance" },
+            .{ .kind = .usage, .usage = "usage [--period <24h|7d|30d>]" },
+        },
+    },
     .{ .entries = &.{
         .{ .kind = .status, .usage = "status" },
         .{ .kind = .doctor, .usage = "doctor" },
