@@ -569,6 +569,7 @@ describe("cli: status", () => {
           auth: "missing",
           auth_refreshable: false,
           auth_help: MISSING_AUTH_MESSAGE,
+          sandbox: platform() === "darwin" ? "os" : "none",
         });
         expect(doctorJson).toMatchObject({
           auth: "missing",
@@ -3155,6 +3156,8 @@ function modelsGatewayEnv(home: string, modelsUrl: string) {
   return {
     AI_GATEWAY_API_KEY: SEEDED_GATEWAY_TOKEN,
     VERCEL_OIDC_TOKEN: undefined,
+    OPENAI_API_KEY: undefined,
+    XAI_API_KEY: undefined,
     HOME: home,
     FX_DISABLE_KEYCHAIN: "1",
     FX_AUTO_UPGRADE: "0",
@@ -3425,6 +3428,7 @@ describe("cli: models", () => {
   test(
     "fx models rejects E2E gateway redirects without contacting the target",
     async () => {
+      const home = createIsolatedTestHome();
       const captureRequests: string[] = [];
       const captureServer = Bun.serve({
         hostname: "127.0.0.1",
@@ -3446,11 +3450,10 @@ describe("cli: models", () => {
 
       try {
         const r = await runFx(["models", "--json"], {
-          env: {
-            AI_GATEWAY_API_KEY: "redirect-proof-key",
-            VERCEL_OIDC_TOKEN: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `http://127.0.0.1:${redirectServer.port}/v1/models`,
-          },
+          env: modelsGatewayEnv(
+            home,
+            `http://127.0.0.1:${redirectServer.port}/v1/models`,
+          ),
         });
 
         expect(captureRequests).toEqual([]);
@@ -3464,6 +3467,7 @@ describe("cli: models", () => {
       } finally {
         redirectServer.stop(true);
         captureServer.stop(true);
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,

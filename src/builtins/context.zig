@@ -3,6 +3,7 @@ const background_runtime = @import("../core/background/background_runtime.zig");
 const change_tracker = @import("../core/workspace/change_tracker.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const host = @import("../core/hosts/host.zig");
+const host_target = @import("../core/hosts/target.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_context_encoding = @import("../core/shared/model_context_encoding.zig");
 const pathing = @import("../core/workspace/pathing.zig");
@@ -180,6 +181,7 @@ const SelectionOptions = struct {
     initial_omission_summary: ?context_contract.ContextOmissionSummary = null,
     home: ?[]const u8 = null,
     initial: bool,
+    load_project_instruction_files: bool = true,
     context_limits: context_limits.Values = .{},
 };
 
@@ -242,6 +244,10 @@ const SelectionScratch = struct {
     }
 };
 
+fn loadsProjectInstructionFiles() bool {
+    return !host_target.is_wasm;
+}
+
 fn gatherProjectContext(alloc: Allocator, input: InitialContextInput) context_contract.ProviderError!ProviderContext {
     return gatherProjectContextWithHome(alloc, input, io_mod.getenv("HOME"));
 }
@@ -258,6 +264,7 @@ fn gatherProjectContextWithHome(
         .initial_omission_summary = input.omission_summary,
         .home = home,
         .initial = true,
+        .load_project_instruction_files = loadsProjectInstructionFiles(),
         .context_limits = input.context_limits,
     });
 }
@@ -269,6 +276,7 @@ fn selectApplicableProjectContext(alloc: Allocator, input: LaterContextInput) co
         .delivered_sources = input.delivered_sources,
         .evaluated_endpoints = input.evaluated_endpoints,
         .initial = false,
+        .load_project_instruction_files = loadsProjectInstructionFiles(),
         .context_limits = input.context_limits,
     });
 }
@@ -291,40 +299,44 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
     if (options.initial) {
         try scratch.addEvaluated(options.workspace_root);
         try scratch.addRankingEndpoint(options.workspace_root);
-
-        if (options.home) |home| {
-            const canonical_home: ?[]u8 = io_mod.realpathAlloc(arena, home) catch |err| blk: {
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                try scratch.addOmission(home, .home_unavailable);
-                break :blk null;
-            };
-            if (canonical_home) |home_root| {
-                global_source_path = try std.fs.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
-                global_rule = try loadRuleForSelection(arena, &scratch, global_source_path.?, options.context_limits.project_instruction_file_bytes);
-                if (pathing.pathInside(home_root, options.workspace_root)) {
-                    try collectLaunchAncestorCandidates(arena, &scratch, home_root, options.workspace_root, options.delivered_sources);
-                } else {
-                    try scratch.addOmission(options.workspace_root, .home_outside_workspace);
-                }
-            }
-        } else {
-            try scratch.addOmission("HOME", .home_unavailable);
-        }
-
-        if (std.fs.path.isAbsolute(options.workspace_root)) {
-            const project_source = try std.fs.path.join(arena, &.{ options.workspace_root, "AGENTS.md" });
-            if (global_source_path == null or
-                !std.mem.eql(u8, global_source_path.?, project_source))
-            {
-                project_rule = try loadRuleForSelection(arena, &scratch, project_source, options.context_limits.project_instruction_file_bytes);
-            }
-        } else {
-            try scratch.addOmission(options.workspace_root, .unsafe_target);
-        }
     }
 
-    for (options.targets) |target| {
-        try collectTargetCandidates(arena, &scratch, options, target);
+    if (options.load_project_instruction_files) {
+        if (options.initial) {
+            if (options.home) |home| {
+                const canonical_home: ?[]u8 = io_mod.realpathAlloc(arena, home) catch |err| blk: {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    try scratch.addOmission(home, .home_unavailable);
+                    break :blk null;
+                };
+                if (canonical_home) |home_root| {
+                    global_source_path = try std.fs.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
+                    global_rule = try loadRuleForSelection(arena, &scratch, global_source_path.?, options.context_limits.project_instruction_file_bytes);
+                    if (pathing.pathInside(home_root, options.workspace_root)) {
+                        try collectLaunchAncestorCandidates(arena, &scratch, home_root, options.workspace_root, options.delivered_sources);
+                    } else {
+                        try scratch.addOmission(options.workspace_root, .home_outside_workspace);
+                    }
+                }
+            } else {
+                try scratch.addOmission("HOME", .home_unavailable);
+            }
+
+            if (std.fs.path.isAbsolute(options.workspace_root)) {
+                const project_source = try std.fs.path.join(arena, &.{ options.workspace_root, "AGENTS.md" });
+                if (global_source_path == null or
+                    !std.mem.eql(u8, global_source_path.?, project_source))
+                {
+                    project_rule = try loadRuleForSelection(arena, &scratch, project_source, options.context_limits.project_instruction_file_bytes);
+                }
+            } else {
+                try scratch.addOmission(options.workspace_root, .unsafe_target);
+            }
+        }
+
+        for (options.targets) |target| {
+            try collectTargetCandidates(arena, &scratch, options, target);
+        }
     }
 
     var usable: std.ArrayList(*RuleCandidate) = .empty;
@@ -1632,6 +1644,36 @@ test "later added-root targets are evaluated without loading added instructions"
     try std.testing.expectEqual(@as(usize, 0), context.notices.len);
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "ADDED_ROOT_SENTINEL") == null);
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "target outside workspace") == null);
+}
+
+test "native hosts still load project instruction files" {
+    try std.testing.expect(loadsProjectInstructionFiles());
+}
+
+test "hosts without instruction files keep client omissions and skip home probes" {
+    const alloc = std.testing.allocator;
+    var context = try selectProjectContext(alloc, .{
+        .workspace_root = "/repo",
+        .targets = &.{},
+        .initial_omissions = &.{.{
+            .source = "https://example.test/context.txt",
+            .reason = .unsafe_target,
+        }},
+        .home = "/repo",
+        .initial = true,
+        .load_project_instruction_files = false,
+    });
+    defer context.deinit(alloc);
+
+    try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "reason=\"home unavailable\"") == null);
+    try std.testing.expect(std.mem.find(
+        u8,
+        context.modelVisibleBytes(),
+        "<project-rules-omitted from=\"https://example.test/context.txt\" reason=\"unsafe target\" />",
+    ) != null);
+    try std.testing.expectEqual(@as(usize, 1), context.notices.len);
+    try std.testing.expect(std.mem.find(u8, context.notices[0], "home unavailable") == null);
+    try std.testing.expect(std.mem.find(u8, context.notices[0], "unsafe target") != null);
 }
 
 test "HOME availability failures and non-ancestor diagnostics stay explicit" {
