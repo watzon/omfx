@@ -494,7 +494,10 @@ profileStoredKeyTmuxTest(
 
     await session.sendText("/setup");
     await session.waitForText("API key", TIMEOUT);
-    await session.sendKeys("Down");
+    // omfx: skip past the two direct provider sign-ins to reach the API key.
+    for (let index = 0; index < 3; index += 1) {
+      await session.sendKeys("Down");
+    }
     await session.sendKeys("Enter");
     await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
     await session.sendLiteralText(STORED_TOKEN);

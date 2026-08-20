@@ -780,6 +780,24 @@ describe("cli: status", () => {
     TIMEOUT,
   );
 
+  // omfx: upstream release artifacts would replace the fork binary.
+  test(
+    "fx upgrade refuses upstream release artifacts",
+    async () => {
+      const result = await runFx(["upgrade", "--json"], {
+        env: NO_GATEWAY_AUTH,
+      });
+      expect(result.code).not.toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout.trim())).toEqual({
+        kind: "upgrade",
+        error: "upstream upgrades are disabled in omfx",
+        code: "UpstreamUpgradesDisabled",
+      });
+    },
+    TIMEOUT,
+  );
+
   test(
     "fx status --json defaults permission mode to auto",
     async () => {

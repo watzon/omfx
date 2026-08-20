@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -37,6 +37,10 @@ const TIMEOUT = 30_000;
 const UPGRADE_TIMEOUT = TIMEOUT * 2;
 const SESSION_PICKER_META_RE = /\bturns?\b/;
 const SELECTED_COMPLETION_SGR = "\x1b[1m\x1b[38;5;255m";
+// omfx: the fork never downloads or installs upstream fx release artifacts.
+const upstreamUpgradeTest = test.skipIf(
+  !tmuxAvailable() || existsSync(join(REPO_ROOT, "src", "omfx.zig")),
+);
 
 function sessionIdFromHome(home: string): string {
   const sessions = join(home, ".fx", "sessions");
@@ -4910,7 +4914,7 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT * 5,
 );
 
-test.skipIf(!tmuxAvailable())(
+upstreamUpgradeTest(
   "upgrade ctrl-g reloads the background-installed binary and resumes",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-")));
@@ -5027,7 +5031,7 @@ test.skipIf(!tmuxAvailable())(
   UPGRADE_TIMEOUT * 2,
 );
 
-test.skipIf(!tmuxAvailable())(
+upstreamUpgradeTest(
   "upgrade ctrl-g repairs an exact corrupt boundary and resumes",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-corrupt-")));
