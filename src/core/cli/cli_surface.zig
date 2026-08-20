@@ -732,7 +732,14 @@ fn runNonInteractiveWithDeps(
             // provider (openai, xai/grok); bare `fx login` stays Vercel.
             if (rest.len == 1) {
                 if (omfx_registry.byKey(std.mem.sliceTo(rest[0], 0))) |def| {
-                    omfx_oauth_flows.runLogin(alloc, cfg.gateway_provider.oauth_transport, def) catch |err| {
+                    var login_deps = deps;
+                    omfx_oauth_flows.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        def,
+                        &login_deps,
+                        writeDirectProviderLoginNotice,
+                    ) catch |err| {
                         const message = switch (err) {
                             error.AuthorizationDenied => "fx login: authorization denied\n",
                             error.DeviceCodeExpired, error.CallbackTimedOut => "fx login: authorization expired; try again\n",
@@ -1520,6 +1527,12 @@ fn writeStdout(deps: RunDeps, text: []const u8) !void {
 
 fn writeStderr(deps: RunDeps, text: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, text);
+}
+
+// omfx: direct-provider login sends progress through the CLI stderr owner.
+fn writeDirectProviderLoginNotice(ctx: ?*anyopaque, text: []const u8) void {
+    const deps: *const RunDeps = @ptrCast(@alignCast(ctx orelse return));
+    writeStderr(deps.*, text) catch {};
 }
 
 fn runPasteSetup(

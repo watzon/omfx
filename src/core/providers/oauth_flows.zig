@@ -81,8 +81,13 @@ pub fn runLogin(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     def: *const registry.Def,
+    notify_ctx: ?*anyopaque,
+    notify_fn: *const fn (?*anyopaque, []const u8) void,
 ) !void {
-    _ = try runLoginWith(alloc, transport, def, .{});
+    _ = try runLoginWith(alloc, transport, def, .{
+        .ctx = notify_ctx,
+        .notify_fn = notify_fn,
+    });
 }
 
 // --- Two-phase login -----------------------------------------------------
@@ -233,7 +238,7 @@ const Deps = struct {
     ctx: ?*anyopaque = null,
     now_ms: *const fn (?*anyopaque) i64 = defaultNowMs,
     sleep_ms: *const fn (?*anyopaque, u64) void = defaultSleepMs,
-    notify_fn: *const fn (?*anyopaque, []const u8) void = defaultNotify,
+    notify_fn: *const fn (?*anyopaque, []const u8) void = discardNotify,
     open_url_fn: *const fn (?*anyopaque, Allocator, []const u8) bool = defaultOpenUrl,
     store: Store = .{},
     /// Overrides the registered loopback port. Only tests set this; production
@@ -275,9 +280,7 @@ fn defaultSleepMs(_: ?*anyopaque, millis: u64) void {
     io_mod.sleep(millis *| std.time.ns_per_ms);
 }
 
-fn defaultNotify(_: ?*anyopaque, text: []const u8) void {
-    std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text) catch {};
-}
+fn discardNotify(_: ?*anyopaque, _: []const u8) void {}
 
 /// Mirrors `login_flow`: `FX_NO_OPEN_BROWSER` suppresses the launch, and the
 /// URL is always printed so a manual copy still works.
