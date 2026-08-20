@@ -20,6 +20,8 @@ type FakeProvider = {
   stop: () => void;
 };
 
+type FakeModel = string | Record<string, unknown>;
+
 function sse(events: unknown[]): string {
   return (
     events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") +
@@ -29,7 +31,7 @@ function sse(events: unknown[]): string {
 
 function startFakeProvider(
   respond: (request: CapturedRequest, index: number) => unknown[],
-  models: string[] = [],
+  models: FakeModel[] = [],
 ): FakeProvider {
   const requests: CapturedRequest[] = [];
   const server = Bun.serve({
@@ -37,7 +39,11 @@ function startFakeProvider(
     port: 0,
     async fetch(req) {
       if (req.method === "GET") {
-        return Response.json({ data: models.map((id) => ({ id })) });
+        return Response.json({
+          data: models.map((model) =>
+            typeof model === "string" ? { id: model } : model
+          ),
+        });
       }
       const captured: CapturedRequest = {
         path: new URL(req.url).pathname,
@@ -66,6 +72,26 @@ function tempHome(): string {
   const home = mkdtempSync(join(tmpdir(), "fx-e2e-direct-providers-"));
   cleanups.push(() => rmSync(home, { recursive: true, force: true }));
   return home;
+}
+
+function seedOpenAiOAuth(home: string): void {
+  const profile = join(home, ".fx");
+  mkdirSync(profile, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(profile, "auth-openai.json"),
+    JSON.stringify({
+      version: 1,
+      provider: "openai",
+      access_token: "test-openai-oauth-token",
+      refresh_token: null,
+      expires_at_ms: Date.now() + 60 * 60 * 1000,
+      token_url: "https://auth.openai.com/oauth/token",
+      client_id: "test-client",
+      scope: "openid profile email offline_access",
+      account_id: "test-account",
+    }) + "\n",
+    { mode: 0o600 },
+  );
 }
 
 const baseEnv = {
@@ -152,6 +178,60 @@ test(
     expect(request.body.tools[0].type).toBe("function");
     expect(request.body.tools[0].name).toBeString();
     expect(request.body.input[0].type).toBe("message");
+  },
+  TIMEOUT,
+);
+
+test(
+  "openai subscription requests omit the unsupported output token limit",
+  async () => {
+    const provider = startFakeProvider(
+      () => [
+        { type: "response.created", response: { id: "resp-oauth" } },
+        { type: "response.output_text.delta", delta: "hello from subscription" },
+        {
+          type: "response.completed",
+          response: { id: "resp-oauth", usage: { input_tokens: 3, output_tokens: 2 } },
+        },
+      ],
+      [{
+        id: "openai/gpt-5.6-sol",
+        type: "language",
+        tags: ["reasoning", "tool-use"],
+        reasoning_options: [{ type: "effort", values: ["high", "max"] }],
+        context_window: 1_050_000,
+        max_tokens: 128_000,
+      }],
+    );
+    cleanups.push(provider.stop);
+    const home = tempHome();
+    seedOpenAiOAuth(home);
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ model: "openai/gpt-5.6-sol", effort: "high" }) + "\n",
+      { mode: 0o600 },
+    );
+
+    const result = await runFx(["ask", "--no-save", "--json", "ping"], {
+      env: {
+        ...baseEnv,
+        HOME: home,
+        AI_GATEWAY_API_KEY: "test-catalog-key",
+        OMFX_OPENAI_BASE_URL: provider.url,
+        FX_E2E_GATEWAY_MODELS_URL: `${provider.url}/coding-agent/v1/models`,
+        FX_MODEL: "openai/gpt-5.6-sol",
+      },
+    });
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toBe("hello from subscription");
+    expect(provider.requests).toHaveLength(1);
+    const request = provider.requests[0]!;
+    expect(request.path).toBe("/responses");
+    expect(request.authorization).toBe("Bearer test-openai-oauth-token");
+    expect(request.body.model).toBe("gpt-5.6-sol");
+    expect(request.body.reasoning).toEqual({ effort: "high" });
+    expect(request.body).not.toHaveProperty("max_output_tokens");
   },
   TIMEOUT,
 );

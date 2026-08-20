@@ -41,6 +41,10 @@ fn routeForModel(model: []const u8) ?struct {
     return .{ .def = def, .kind = kind };
 }
 
+fn usesChatgptBackend(def: *const registry.Def, kind: provider_credentials.Kind) bool {
+    return kind == .oauth and std.mem.eql(u8, def.key, "openai");
+}
+
 fn writeVisionSchema(alloc: Allocator, tool_registry: tool_dispatch.Registry) ![]u8 {
     const vision_tool = tool_registry.lookup("vision") orelse return error.VisionToolNotRegistered;
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -90,7 +94,8 @@ fn buildDirect(
     var options: openai_json.BuildOptions = .{
         .provider_options = request.provider_options,
         .tool_choice = request.tool_choice,
-        .max_output_tokens = request.max_output_tokens,
+        // The ChatGPT Codex backend rejects this public Responses API field.
+        .max_output_tokens = if (usesChatgptBackend(def, kind)) null else request.max_output_tokens,
         .verified_images = request.verified_images,
     };
     if (request.response_format) |format| {
@@ -163,7 +168,7 @@ fn streamDirect(
     const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, path });
     defer alloc.free(url);
 
-    const chatgpt_backend = oauth and std.mem.eql(u8, def.key, "openai");
+    const chatgpt_backend = usesChatgptBackend(def, credential.kind);
     debug_trace.logf("provider", "direct stream provider={s} kind={t} wire={t}", .{ def.key, credential.kind, wire });
     return openai_stream.stream(alloc, .{
         .url = url,
@@ -267,6 +272,34 @@ test "merging tool schemas keeps existing entries and appends extras" {
     try std.testing.expectEqualStrings("[{\"name\":\"b\"}]", from_empty);
 
     try std.testing.expectError(error.InvalidToolSchema, mergeToolsJson(alloc, "{}", &.{"{}"}));
+}
+
+test "openai subscription requests omit the unsupported output token limit" {
+    const alloc = std.testing.allocator;
+    const def = registry.byKey("openai").?;
+    const request = agent_stream_provider.BuildRequest{
+        .model = "openai/gpt-5.6-sol",
+        .serialized_tools = "[]",
+        .messages = &.{},
+        .tool_choice = .auto,
+        .provider_options = .{},
+        .max_output_tokens = 128_000,
+    };
+
+    const oauth_body = try buildDirect(alloc, def, .oauth, request);
+    defer alloc.free(oauth_body);
+    var oauth_parsed = try std.json.parseFromSlice(std.json.Value, alloc, oauth_body, .{});
+    defer oauth_parsed.deinit();
+    try std.testing.expect(oauth_parsed.value.object.get("max_output_tokens") == null);
+
+    const api_key_body = try buildDirect(alloc, def, .api_key, request);
+    defer alloc.free(api_key_body);
+    var api_key_parsed = try std.json.parseFromSlice(std.json.Value, alloc, api_key_body, .{});
+    defer api_key_parsed.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 128_000),
+        api_key_parsed.value.object.get("max_output_tokens").?.integer,
+    );
 }
 
 test "models without provider credentials fall through" {
