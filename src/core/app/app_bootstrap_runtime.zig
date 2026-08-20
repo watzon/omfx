@@ -22,6 +22,8 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const core_input_runtime = @import("../input/runtime.zig");
+// omfx: direct provider auth also satisfies startup onboarding.
+const omfx_provider_credentials = @import("../providers/provider_credentials.zig");
 const ui_render = @import("../../ui/render.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
@@ -57,6 +59,7 @@ fn BootstrapDeps(comptime App: type) type {
         const WelcomeMessageFn = *const fn (Allocator) anyerror![]u8;
         const BeginFreshPersistedSessionFn = *const fn (*App) anyerror!void;
         const EnableSessionStoresFn = *const fn (*App) void;
+        const DirectProviderCredentialAvailableFn = *const fn (Allocator) anyerror!bool;
         bootstrap_interactive_app: BootstrapInteractiveAppFn,
         configure_session_preferences: ConfigureSessionPreferencesFn,
         initialize_persistence: InitializePersistenceFn,
@@ -68,6 +71,7 @@ fn BootstrapDeps(comptime App: type) type {
         welcome_message: WelcomeMessageFn,
         begin_fresh_persisted_session: BeginFreshPersistedSessionFn,
         enable_session_stores: EnableSessionStoresFn,
+        direct_provider_credential_available: DirectProviderCredentialAvailableFn,
         terminal_title: host.TerminalTitle,
     };
 }
@@ -107,8 +111,14 @@ pub fn Runtime(comptime App: type) type {
                 .welcome_message = welcomeMessageDefault,
                 .begin_fresh_persisted_session = beginFreshPersistedSessionDefault,
                 .enable_session_stores = enableSessionStoresDefault,
+                .direct_provider_credential_available = directProviderCredentialAvailableDefault,
                 .terminal_title = capability_providers.terminal_title,
             };
+        }
+
+        // omfx: keep the fork credential probe behind the bootstrap seam.
+        fn directProviderCredentialAvailableDefault(alloc: Allocator) !bool {
+            return omfx_provider_credentials.any_available(alloc);
         }
 
         fn bootstrapInteractiveAppDefault(cfg: app_lifecycle.BootstrapConfig) !app_lifecycle.StartupState {
@@ -216,7 +226,12 @@ pub fn Runtime(comptime App: type) type {
                 startup.credential_onboarding_skipped,
             );
             const startup_auth_view = app.auth.view();
-            if (startup_auth_view.active_source == null and !startup_auth_view.onboarding_skipped) {
+            // omfx: a stored direct provider session is valid startup auth even
+            // though it is not a Gateway credential source.
+            if (startup_auth_view.active_source == null and
+                !try deps.direct_provider_credential_available(app.alloc) and
+                !startup_auth_view.onboarding_skipped)
+            {
                 try app.auth.refreshSourceInventory(app.alloc);
                 app.auth.openOnboardingPicker(app.alloc);
             }
@@ -478,6 +493,7 @@ const TestCapture = struct {
     emit_skill_diagnostic: bool = false,
     emit_config_diagnostics: bool = false,
     startup_with_credential: bool = true,
+    direct_provider_credential_available: bool = false,
     onboarding_skipped: bool = true,
     early_notice_palette_initialized: bool = false,
     events: [16][]const u8 = undefined,
@@ -628,11 +644,16 @@ fn testDeps() BootstrapDeps(TestApp) {
         .welcome_message = welcomeMessageForTest,
         .begin_fresh_persisted_session = beginFreshPersistedSessionForTest,
         .enable_session_stores = enableSessionStoresForTest,
+        .direct_provider_credential_available = directProviderCredentialAvailableForTest,
         .terminal_title = .{
             .set_fn = setTerminalTitleLabelForTest,
             .clear_fn = clearTerminalTitleForTest,
         },
     };
+}
+
+fn directProviderCredentialAvailableForTest(_: Allocator) !bool {
+    return active_capture.?.direct_provider_credential_available;
 }
 
 fn bootstrapInteractiveAppForTest(cfg: app_lifecycle.BootstrapConfig) !app_lifecycle.StartupState {
@@ -939,6 +960,21 @@ test "app_bootstrap_runtime opens onboarding before first frame without a creden
     try std.testing.expect(picker.active);
     try std.testing.expect(picker.include_skip);
     try std.testing.expectEqual(auth_runtime.PickerStage.root, picker.stage);
+    try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
+}
+
+test "app_bootstrap_runtime skips onboarding with direct provider auth" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(alloc);
+    capture.startup_with_credential = false;
+    capture.direct_provider_credential_available = true;
+    capture.onboarding_skipped = false;
+    var app = TestApp.init(alloc);
+    defer app.deinit();
+
+    try runBootstrapForTest(&app, &capture);
+
+    try std.testing.expect(!app.auth.pickerView().active);
     try std.testing.expect(app.shell.render_requests.hasReason(.first_frame));
 }
 

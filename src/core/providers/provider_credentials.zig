@@ -51,6 +51,17 @@ pub fn exists(def: *const registry.Def) bool {
     return preferredKind(def) != null;
 }
 
+/// True when any direct provider has an API key or valid stored OAuth session.
+pub fn any_available(alloc: Allocator) !bool {
+    for (&registry.defs) |*def| {
+        if (envApiKey(def) != null) return true;
+        var session = (try auth_store.load(alloc, def.key)) orelse continue;
+        session.deinit(alloc);
+        return true;
+    }
+    return false;
+}
+
 /// True when the model routes to a direct provider that has a credential,
 /// which satisfies the app's credential gate without a gateway credential.
 pub fn modelHasDirectCredential(model: []const u8) bool {

@@ -319,6 +319,99 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
 });
 
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
+  for (const directAuth of [
+    {
+      label: "OpenAI",
+      provider: "openai",
+      model: "openai/gpt-5.6-sol",
+      bareModel: "gpt-5.6-sol",
+      baseUrlEnv: "OMFX_OPENAI_BASE_URL",
+      tokenUrl: "https://auth.openai.com/oauth/token",
+      accountId: "test-account",
+    },
+    {
+      label: "Grok",
+      provider: "xai",
+      model: "xai/grok-4",
+      bareModel: "grok-4",
+      baseUrlEnv: "OMFX_XAI_BASE_URL",
+      tokenUrl: "https://auth.x.ai/oauth/token",
+      accountId: null,
+    },
+  ]) test(
+    `stored ${directAuth.label} auth suppresses onboarding across restart`,
+    async () => {
+      const home = realpathSync(mkdtempSync(join(tmpdir(), `fx-e2e-${directAuth.provider}-auth-restart-`)));
+      const profile = join(home, ".fx");
+      const stderrPath = join(home, "stderr.log");
+      mkdirSync(profile, { recursive: true, mode: 0o700 });
+      writeFileSync(
+        join(profile, `auth-${directAuth.provider}.json`),
+        JSON.stringify({
+          version: 1,
+          provider: directAuth.provider,
+          access_token: `test-${directAuth.provider}-oauth-token`,
+          refresh_token: null,
+          expires_at_ms: Date.now() + 60 * 60 * 1000,
+          token_url: directAuth.tokenUrl,
+          client_id: "test-client",
+          scope: "openid profile email offline_access",
+          account_id: directAuth.accountId,
+        }) + "\n",
+        { mode: 0o600 },
+      );
+      writeFileSync(
+        join(profile, "settings.json"),
+        JSON.stringify({ model: directAuth.model }) + "\n",
+        { mode: 0o600 },
+      );
+      writeFileSync(stderrPath, "");
+
+      const provider = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch() {
+          return Response.json({ data: [{ id: directAuth.bareModel }] });
+        },
+      });
+      const providerUrl = `http://127.0.0.1:${provider.port}`;
+      const env: Record<string, string | undefined> = {
+        AI_GATEWAY_API_KEY: undefined,
+        VERCEL_OIDC_TOKEN: undefined,
+        OPENAI_API_KEY: undefined,
+        XAI_API_KEY: undefined,
+        HOME: home,
+        FX_AUTO_UPGRADE: "0",
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "0",
+        FX_E2E_GATEWAY_MODELS_URL: `${providerUrl}/coding-agent/v1/models`,
+        [directAuth.baseUrlEnv]: providerUrl,
+      };
+
+      try {
+        session = await TmuxSession.create({ env, stderrPath });
+        const initial = await session.waitForComposer(TIMEOUT);
+        expect(initial).not.toContain("Welcome to fx");
+
+        await session.kill();
+        session = null;
+
+        session = await TmuxSession.create({ env, stderrPath });
+        const restarted = await session.waitForComposer(TIMEOUT);
+        expect(restarted).not.toContain("Welcome to fx");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        provider.stop(true);
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
   test(
     "/setup opens the setup hub without source rows",
     async () => {
