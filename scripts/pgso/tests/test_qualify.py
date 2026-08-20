@@ -14,6 +14,7 @@ from scripts.pgso.pipeline import PipelinePaths
 from scripts.pgso.profile_supplement import MappedProfile, ProfileSupplement
 from scripts.pgso.qualify import (
     BENCHMARK_PLANS,
+    PRODUCTION_PROFILE_MODULE,
     STARTUP_COMMANDS,
     BenchmarkPair,
     EvidenceRecorder,
@@ -620,7 +621,9 @@ class PgsoQualificationTests(unittest.TestCase):
             output_text.write_text("supplement\n")
             return ProfileSupplement(
                 text="supplement\n",
-                function_names=("fx;core.output.diff.compute",),
+                function_names=(
+                    f"{PRODUCTION_PROFILE_MODULE};core.output.diff.compute",
+                ),
                 total_counter_value=8,
             )
 
@@ -632,7 +635,7 @@ class PgsoQualificationTests(unittest.TestCase):
             mock.patch(
                 "scripts.pgso.qualify.create_profile_supplement",
                 side_effect=fake_create,
-            ),
+            ) as create_supplement,
             mock.patch(
                 "scripts.pgso.qualify.merge_profile_supplement"
             ) as merge,
@@ -652,6 +655,13 @@ class PgsoQualificationTests(unittest.TestCase):
             tuple(built_selectors),
         )
         self.assertEqual(len(BENCHMARK_PLANS), merge.call_count)
+        self.assertTrue(
+            all(
+                call.kwargs["destination_module"]
+                == PRODUCTION_PROFILE_MODULE
+                for call in create_supplement.call_args_list
+            )
+        )
 
         def fake_map(_toolchain, **kwargs):
             kwargs["output_text"].write_text("mapped text\n")
@@ -670,7 +680,7 @@ class PgsoQualificationTests(unittest.TestCase):
             mock.patch(
                 "scripts.pgso.qualify.create_mapped_benchmark_profile",
                 side_effect=fake_map,
-            ),
+            ) as map_profile,
             mock.patch("scripts.pgso.qualify.apply_profile"),
             mock.patch(
                 "scripts.pgso.qualify.link_candidate",
@@ -682,6 +692,13 @@ class PgsoQualificationTests(unittest.TestCase):
                 paths,
                 linked,
             )
+        self.assertTrue(
+            all(
+                call.kwargs["source_module"]
+                == PRODUCTION_PROFILE_MODULE
+                for call in map_profile.call_args_list
+            )
+        )
 
         with mock.patch(
             "scripts.pgso.qualify.verify_supplement_functions",

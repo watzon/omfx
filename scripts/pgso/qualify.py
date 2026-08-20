@@ -40,6 +40,8 @@ STARTUP_WARMUP_RUNS = 10
 STARTUP_MINIMUM_ROUNDS = 10
 STARTUP_MAX_RUNS_PER_ROUND = 10
 MAXIMUM_REGRESSION = 0.10
+# omfx: LLVM names the production profile module after the executable.
+PRODUCTION_PROFILE_MODULE = "omfx"
 REQUIRED_EVIDENCE = (
     "identity",
     "runtime",
@@ -687,7 +689,7 @@ def build_profile_linked_benchmarks(
             benchmark_ir=pair.profile_use_ir,
             output_text=supplement_path,
             source_module=plan.profile_module,
-            destination_module="fx",
+            destination_module=PRODUCTION_PROFILE_MODULE,
             allowed_prefixes=plan.function_prefixes,
             log_dir=(
                 production_paths.logs / "supplements" / plan.selector
@@ -740,12 +742,13 @@ def relink_profile_linked_benchmarks(
             benchmark_profile=pair.merged_profile,
             output_text=mapped_text,
             output_profile=mapped_profile_path,
-            source_module="fx",
+            source_module=PRODUCTION_PROFILE_MODULE,
             destination_module=plan.profile_module,
             log_dir=pair_paths.logs / "production-profile-map",
         )
+        production_prefix = f"{PRODUCTION_PROFILE_MODULE};"
         supplemented_functions = {
-            name.removeprefix("fx;")
+            name.removeprefix(production_prefix)
             for name in linked.supplement.function_names
         }
         if not supplemented_functions.issubset(
@@ -804,10 +807,11 @@ def profile_linked_benchmark_evidence(
         function_modes = verify_supplement_functions(
             production_ir,
             linked.supplement.function_names,
-            production_module="fx",
+            production_module=PRODUCTION_PROFILE_MODULE,
         )
+        production_prefix = f"{PRODUCTION_PROFILE_MODULE};"
         benchmark_profile_names = tuple(
-            f"{plan.profile_module};{name.removeprefix('fx;')}"
+            f"{plan.profile_module};{name.removeprefix(production_prefix)}"
             for name in linked.supplement.function_names
         )
         benchmark_modes = verify_supplement_functions(
