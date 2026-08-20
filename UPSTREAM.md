@@ -68,12 +68,12 @@ Sync weekly, and before you start any new feature branch.
    ```bash
    zig fmt --check src/ build.zig
    zig build
-   zig build test
    ./zig-out/bin/omfx --version
-   cd tests/e2e && bun install && bun test cli.test.ts
    ```
 
-5. Open a PR from the sync branch into `main` and let CI pass before merging.
+   Run only the focused tests for conflicts and affected fork hooks. Do not run the complete CI suite locally.
+
+5. Merge the sync branch into local `main`. Push `main` only when the user asks to update the remote fork. Open a pull request and use GitHub CI only when the user explicitly requests a pull request.
 
 ## Versioning
 

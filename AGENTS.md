@@ -21,9 +21,9 @@ Before reporting the work as ready:
 
 1. Build succeeds.
 2. Focused tests for the changed path pass locally.
-3. The **Full CI** run for the exact current commit passes on every required Linux and macOS runner.
-4. Run the built binary locally and drive at least one real interaction that exercises the change end to end.
-5. Confirm the process did not abort, stderr is clean, and the behavior matches what you are about to tell the user.
+3. Run the built binary locally and drive at least one real interaction that exercises the change end to end.
+4. Confirm the process did not abort, stderr is clean, and the behavior matches what you are about to tell the user.
+5. If the user asked for a pull request, require the GitHub checks for the exact current commit to pass before marking the PR ready or merging it.
 
 If you cannot run the binary in your environment, say so explicitly and ask the user to verify. Do not silently skip this step and declare the work ready. "The tests pass" is not a substitute for running the app.
 
@@ -273,11 +273,11 @@ Assign the label when the PR is opened and keep it accurate when the PR changes.
 
 Keep PR titles as clean imperative sentences, such as `Restore feedback report file clipboard`. Do not add bracketed prefixes such as `[bug]`, `[feature]`, or `[improvement]`. Type belongs in the label, not the title.
 
-## Full CI on Feature Branches
+## GitHub CI for Requested Pull Requests
 
-Do not run the complete deterministic test suite locally as the default development loop. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.
+Do not run the complete deterministic CI suite locally. Run the focused test for the changed path, build the binary, and exercise that path with `./zig-out/bin/fx`.
 
-After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. `.github/workflows/full-ci.yml` runs the following on all four supported native runner architectures:
+Do not push a branch unless the user asks to push or merge it remotely. Do not open a pull request or start GitHub CI unless the user explicitly asks for a pull request. When the user asks for one, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR. `.github/workflows/full-ci.yml` then runs on all four supported native runner architectures:
 
 * `ubuntu-24.04` (x86_64)
 * `ubuntu-24.04-arm` (aarch64)
@@ -463,6 +463,6 @@ The canonical repository is `vercel-labs/fx` on GitHub. All URLs, links, and ref
 
 1. Run `zig fmt --check src/` and the focused tests for the changed path.
 2. Build and exercise the change locally with `./zig-out/bin/fx`.
-3. Push a clean checkpoint commit and open a draft PR immediately.
+3. Only after the user explicitly asks for a pull request, push a clean checkpoint commit and open a draft PR.
 4. Require **Full CI** and the final ship gate to pass on the exact current commit across all four native runners.
 5. Update docs if behavior changed.
