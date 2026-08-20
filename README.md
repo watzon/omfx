@@ -14,6 +14,14 @@ The binary is named `omfx`. The build also installs an `fx`-named copy, so the u
 
 omfx does not have binary releases yet. Build it from source (see [Build from source](#build-from-source)), then put `zig-out/bin/omfx` on your `PATH`. The upstream `fx.sh` installer installs upstream fx, not omfx.
 
+To build and install `omfx` into a `PATH` prefix in one step, run:
+
+```bash
+zig build -Doptimize=ReleaseSafe -Dfx-alias=false --prefix ~/.local
+```
+
+`-Dfx-alias=false` skips the `fx`-named compatibility copy, so the install cannot shadow an upstream fx binary. The default build keeps the copy because the upstream test suites reference `zig-out/bin/fx`.
+
 ## Run fx
 
 To get started, sign in with Vercel:

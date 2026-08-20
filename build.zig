@@ -70,8 +70,13 @@ pub fn build(b: *std.Build) void {
 
     // omfx: also install the binary under the upstream name so upstream
     // tests, benchmarks, and docs that reference zig-out/bin/fx stay valid.
-    const fx_alias = b.addInstallArtifact(exe, .{ .dest_sub_path = "fx" });
-    b.getInstallStep().dependOn(&fx_alias.step);
+    // Pass -Dfx-alias=false when installing to a PATH prefix, so the alias
+    // cannot shadow a real upstream fx install.
+    const fx_alias_enabled = b.option(bool, "fx-alias", "Install an fx-named copy of omfx (default: true)") orelse true;
+    if (fx_alias_enabled) {
+        const fx_alias = b.addInstallArtifact(exe, .{ .dest_sub_path = "fx" });
+        b.getInstallStep().dependOn(&fx_alias.step);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
