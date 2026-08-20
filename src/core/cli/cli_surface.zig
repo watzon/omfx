@@ -31,6 +31,7 @@ const session_store = @import("../session/session_store.zig");
 const usage_report = @import("../session/usage_report.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
+const omfx = @import("../../omfx.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
@@ -1319,6 +1320,17 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .upgrade, "upgrade", err, rest);
                 return .handled_failure;
             };
+
+            // omfx: the upgrade command downloads upstream fx binaries from
+            // the fx.sh CDN, which would replace this fork's binary.
+            if (!omfx.upstream_upgrades_enabled) {
+                if (opts.format == .json) {
+                    try writeJsonCommandFailure(alloc, deps, "upgrade", error.UpstreamUpgradesDisabled, "upstream upgrades are disabled in omfx");
+                } else {
+                    try writeStderr(deps, "fx upgrade: upstream upgrades are disabled in omfx. Update omfx from source with git pull and zig build.\n");
+                }
+                return .handled_failure;
+            }
 
             var startup = deps.load_startup_state_without_credentials(
                 alloc,

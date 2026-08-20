@@ -1,29 +1,18 @@
-```
- ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
- ⠀⠀⠀⠀⠀⢰⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
- ⠀⠀⠀⣠⣶⣿⣿⣷⣶⡶⣶⣶⣆⠀⠀⠀⣴⣶⣶⠆
- ⠀⠀⠀⠉⢹⣿⣿⠉⠉⠀⠘⢿⣿⣧⣀⣾⣿⡿⠃⠀             Tiny, open, embeddable, native coding agent.
- ⠀⠀⠀⠀⣼⣿⡏⠀⠀⠀⠀⠀⠻⣿⣿⣿⠟⠀⠀⠀
- ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -fsSL https://fx.sh/setup.sh | bash
- ⠀⠀⠀⣸⣿⡟⠀⠀⠀⠀⣰⣿⣿⠗⠀⠻⣿⣿⣄⠀
- ⠀⠀⠀⣿⣿⠇⠀⠀⠀⠾⠿⠿⠋⠀⠀⠀⠘⠿⠿⠦             ⚠ Status: Experimental. Use at your own risk.
-  ⠀⣸⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
- ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-```
+# omfx
 
-fx is a coding agent harness and CLI written in Zig, optimized for research and embeddability as part of larger systems.
+The batteries-included fork of [fx](https://github.com/vercel-labs/fx), Vercel's tiny, open, embeddable, native coding agent.
 
-It focuses on minimalism and performance across the board, from system prompt design to its tools, feature set, and 7.8 MiB binary.
+⚠ Status: Experimental. Use at your own risk.
 
-For end users, its CLI output style and form factor aim to be closer to a Unix shell than a heavy "IDE in the terminal" TUI.
+fx is a coding agent harness and CLI written in Zig, optimized for research and embeddability as part of larger systems. It focuses on minimalism and performance across the board, from system prompt design to its tools, feature set, and 7.8 MiB binary. For end users, its CLI output style and form factor aim to be closer to a Unix shell than a heavy "IDE in the terminal" TUI.
 
-It's open source (Apache-2.0), model-agnostic, and suitable for both local and cloud inference.
+omfx keeps all of that and adds batteries on top. It tracks upstream closely; `UPSTREAM.md` describes how. It's open source (Apache-2.0), model-agnostic, and suitable for both local and cloud inference.
+
+The binary is named `omfx`. The build also installs an `fx`-named copy, so the upstream examples below work unchanged.
 
 ## Install
 
-```bash
-curl -fsSL https://fx.sh/setup.sh | bash
-```
+omfx does not have binary releases yet. Build it from source (see [Build from source](#build-from-source)), then put `zig-out/bin/omfx` on your `PATH`. The upstream `fx.sh` installer installs upstream fx, not omfx.
 
 ## Run fx
 
@@ -95,13 +84,13 @@ Read the [fx documentation](https://fx.sh/docs).
 
 ## Build from source
 
-Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
+Building omfx requires [Zig 0.16.0+](https://ziglang.org/download/):
 
 ```bash
-git clone https://github.com/vercel-labs/fx.git
-cd fx
+git clone https://github.com/watzon/omfx.git
+cd omfx
 zig build -Doptimize=ReleaseSafe
-./zig-out/bin/fx
+./zig-out/bin/omfx
 ```
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
@@ -114,5 +103,7 @@ Third-party licenses and attributions are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Credits
+
+omfx is a fork of [vercel-labs/fx](https://github.com/vercel-labs/fx) by the Vercel team.
 
 Interface sounds by [cuelume](https://github.com/Danilaa1/cuelume).
